@@ -35,3 +35,13 @@ reportsRouter.get(
     ok(res, await reportsService.getPayroll(parseQuery(filtersSchema, req.query)));
   }),
 );
+
+/** Detalle por jornada: desglose de horas, tramo nocturno e incidencias. */
+reportsRouter.get(
+  "/detail",
+  requireRole(UserRole.HR_ADMIN),
+  checkFeature(Feature.ADVANCED_REPORTS),
+  asyncHandler(async (req, res) => {
+    ok(res, await reportsService.getDetail(parseQuery(filtersSchema, req.query)));
+  }),
+);

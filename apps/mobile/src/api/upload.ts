@@ -26,15 +26,23 @@ export async function uploadSelfie(photoUri: string, punchType: string): Promise
     contentLength: info.size ?? 0,
   });
 
-  const result = await uploadAsync(presigned.uploadUrl, photoUri, {
-    httpMethod: "PUT",
-    uploadType: FileSystemUploadType.BINARY_CONTENT,
-    // Las cabeceras van firmadas: si no coinciden exactamente, S3 rechaza el PUT.
-    headers: presigned.requiredHeaders,
-  });
+  let result;
+  try {
+    result = await uploadAsync(presigned.uploadUrl, photoUri, {
+      httpMethod: "PUT",
+      uploadType: FileSystemUploadType.BINARY_CONTENT,
+      // Las cabeceras van firmadas: si no coinciden exactamente, S3 rechaza el PUT.
+      headers: presigned.requiredHeaders,
+    });
+  } catch {
+    throw new NetworkError("Sin conexion al subir la foto");
+  }
 
+  if (result.status >= 500) {
+    throw new NetworkError(`El almacenamiento no esta disponible (HTTP ${result.status})`);
+  }
   if (result.status < 200 || result.status >= 300) {
-    throw new NetworkError(`El almacenamiento rechazo la subida (HTTP ${result.status})`);
+    throw new Error(`El almacenamiento rechazo la subida (HTTP ${result.status})`);
   }
 
   return presigned.objectKey;

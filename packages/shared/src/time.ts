@@ -186,3 +186,37 @@ export function weekDaysFrom(date: string): string[] {
 
 /** Zona horaria por defecto para tenants nuevos en LATAM. */
 export const DEFAULT_TIMEZONE = "America/Lima";
+
+export interface PeriodPreset {
+  key: "today" | "yesterday" | "week" | "fortnight1" | "fortnight2" | "month" | "lastMonth";
+  label: string;
+  from: string;
+  to: string;
+}
+
+/**
+ * Periodos de cierre habituales a partir de la fecha local de hoy. Son fechas
+ * operativas: el reporte incluye completas las jornadas que terminan de
+ * madrugada, aunque la salida caiga fuera del rango.
+ */
+export function periodPresets(today: string): PeriodPreset[] {
+  const anchor = new Date(`${today}T12:00:00.000Z`);
+  const year = anchor.getUTCFullYear();
+  const month = anchor.getUTCMonth();
+  const day = (y: number, m: number, d: number) =>
+    new Date(Date.UTC(y, m, d, 12)).toISOString().slice(0, 10);
+  const date = anchor.getUTCDate();
+  const yesterday = day(year, month, date - 1);
+  // Semana laboral de lunes a domingo.
+  const monday = day(year, month, date - ((anchor.getUTCDay() + 6) % 7));
+
+  return [
+    { key: "today", label: "Hoy", from: today, to: today },
+    { key: "yesterday", label: "Ayer", from: yesterday, to: yesterday },
+    { key: "week", label: "Esta semana", from: monday, to: today },
+    { key: "fortnight1", label: "1.a quincena", from: day(year, month, 1), to: day(year, month, 15) },
+    { key: "fortnight2", label: "2.a quincena", from: day(year, month, 16), to: day(year, month + 1, 0) },
+    { key: "month", label: "Mes actual", from: day(year, month, 1), to: day(year, month + 1, 0) },
+    { key: "lastMonth", label: "Mes anterior", from: day(year, month - 1, 1), to: day(year, month, 0) },
+  ];
+}

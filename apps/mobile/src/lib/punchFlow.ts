@@ -1,4 +1,9 @@
-import { VALID_PUNCH_TRANSITIONS, type DaySchedule, type PunchType } from "@scire/shared";
+import {
+  VALID_PUNCH_TRANSITIONS,
+  type DaySchedule,
+  type PunchType,
+  type WeeklySchedule,
+} from "@scire/shared";
 import { ApiError, NetworkError } from "./errors";
 
 /**
@@ -10,6 +15,17 @@ import { ApiError, NetworkError } from "./errors";
  * decisiones que de verdad conviene cubrir con tests.
  */
 
+/** Plazo en que una jornada abierta sigue esperando su salida (igual que la API). */
+const OPEN_SHIFT_MS = 16 * 3_600_000;
+
+export interface OfflineHints {
+  /** Marcaciones en cola, de la mas antigua a la mas reciente. */
+  pending?: readonly { punchType: PunchType; at: number }[];
+  /** Momento de la copia del calendario, si no se pudo actualizar. */
+  staleSince?: number | null;
+  now?: number;
+}
+
 /**
  * Siguiente marcacion que corresponde segun lo ya registrado hoy.
  *
@@ -17,7 +33,29 @@ import { ApiError, NetworkError } from "./errors";
  * regla en `@scire/shared` es lo que evita que la app ofrezca un boton que el
  * backend vaya a rechazar.
  */
-export function nextPunchType(day: DaySchedule | undefined): PunchType | null {
+export function nextPunchType(
+  day: DaySchedule | undefined,
+  current?: WeeklySchedule["currentJornada"],
+  offline: OfflineHints = {},
+): PunchType | null {
+  const now = offline.now ?? Date.now();
+  const fresh = (at: number) => now - at <= OPEN_SHIFT_MS;
+  const sameDay = (at: number) => new Date(at).toDateString() === new Date(now).toDateString();
+
+  // 1. Lo guardado en el dispositivo es lo mas reciente que se ha hecho.
+  const queued = offline.pending?.at(-1);
+  if (queued) {
+    if (queued.punchType === "OUT") return sameDay(queued.at) ? null : "IN";
+    return fresh(queued.at) ? (VALID_PUNCH_TRANSITIONS[queued.punchType][0] ?? null) : "IN";
+  }
+
+  // 2. Copia guardada del calendario: solo vale mientras la jornada siga viva.
+  const { staleSince } = offline;
+  if (staleSince && !(current?.isOpen ? fresh(staleSince) : sameDay(staleSince))) return "IN";
+
+  // 3. Manda el servidor: en turno noche la jornada abierta es la de ayer, y en
+  // turno partido puede tocar una segunda entrada el mismo dia.
+  if (current) return current.allowedPunches[0] ?? null;
   const last = day?.punches.at(-1)?.punchType ?? "NONE";
   return VALID_PUNCH_TRANSITIONS[last][0] ?? null;
 }

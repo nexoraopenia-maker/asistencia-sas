@@ -14,7 +14,9 @@ import {
   ScrollText,
   Settings,
   ShieldCheck,
+  Smartphone,
   Sun,
+  TriangleAlert,
   Users,
 } from "lucide-react";
 import { useTheme } from "next-themes";
@@ -32,9 +34,11 @@ const NAV = [
   { href: "/dashboard/empleados", label: "Empleados", icon: Users },
   { href: "/dashboard/horarios", label: "Horarios y turnos", icon: CalendarClock },
   { href: "/dashboard/reportes", label: "Reportes de nomina", icon: FileSpreadsheet },
+  { href: "/dashboard/incidencias", label: "Incidencias", icon: TriangleAlert },
   { href: "/dashboard/auditoria", label: "Auditoria laboral", icon: ScrollText },
   { href: "/dashboard/configuracion", label: "Configuracion", icon: Settings },
   { href: "/dashboard/suscripcion", label: "Suscripcion", icon: CreditCard },
+  { href: "/descargar", label: "App movil", icon: Smartphone },
 ] as const;
 
 /** Valor centinela del selector: Radix Select no admite value="". */

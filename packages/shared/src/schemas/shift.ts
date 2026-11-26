@@ -109,4 +109,10 @@ export interface WeeklySchedule {
     tardinessMinutes: number;
     overtimeMinutes: number;
   };
+  /** Jornada en curso segun el servidor (puede venir de ayer en turno noche). */
+  currentJornada?: {
+    date: string;
+    isOpen: boolean;
+    allowedPunches: PunchType[];
+  };
 }

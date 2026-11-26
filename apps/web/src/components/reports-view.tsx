@@ -19,6 +19,7 @@ import { toast } from "sonner";
 import { api, qs } from "../lib/api";
 import { daysAgo, formatMinutes, today } from "../lib/format";
 import { useBranch } from "./branch-context";
+import { PeriodPresets } from "./period-presets";
 import {
   Button,
   Card,
@@ -56,6 +57,10 @@ interface PayrollRow {
   branchName: string | null;
   daysWorked: number;
   daysAbsent: number;
+  nightMinutes: number;
+  overtimeTier1Minutes: number;
+  overtimeTier2Minutes: number;
+  incidentCount: number;
   regularMinutes: number;
   lunchMinutes: number;
   tardinessMinutes: number;
@@ -169,6 +174,11 @@ export function ReportsView() {
 
   return (
     <div className="space-y-6">
+      <PeriodPresets range={range} onSelect={setRange} />
+      <p className="text-xs text-muted-foreground">
+        Las fechas son de jornada: un turno que termina de madrugada cuenta completo en el dia en
+        que empezo.
+      </p>
       <div className="flex flex-wrap items-end gap-3">
         <div className="space-y-1.5">
           <Label htmlFor="from">Desde</Label>
@@ -330,7 +340,7 @@ export function ReportsView() {
             <CardHeader>
               <CardTitle>Desglose por colaborador</CardTitle>
               <CardDescription>
-                Horas regulares, refrigerio, tardanzas y salidas anticipadas del periodo
+                Horas, tramo nocturno, sobretiempo por tramos (T1/T2) e incidencias del periodo
               </CardDescription>
             </CardHeader>
             <Table>
@@ -339,11 +349,14 @@ export function ReportsView() {
                   <TableHead>Colaborador</TableHead>
                   <TableHead>Sucursal</TableHead>
                   <TableHead className="text-right">Dias</TableHead>
-                  <TableHead className="text-right">Regulares</TableHead>
+                  <TableHead className="text-right">Trabajadas</TableHead>
+                  <TableHead className="text-right">Nocturnas</TableHead>
                   <TableHead className="text-right">Refrigerio</TableHead>
                   <TableHead className="text-right">Tardanza</TableHead>
                   <TableHead className="text-right">Salida ant.</TableHead>
-                  <TableHead className="text-right">Extra</TableHead>
+                  <TableHead className="text-right">Extra T1</TableHead>
+                  <TableHead className="text-right">Extra T2</TableHead>
+                  <TableHead className="text-right">Incid.</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -364,6 +377,9 @@ export function ReportsView() {
                       {formatMinutes(row.regularMinutes)}
                     </TableCell>
                     <TableCell className="text-right tabular-nums text-muted-foreground">
+                      {formatMinutes(row.nightMinutes)}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums text-muted-foreground">
                       {formatMinutes(row.lunchMinutes)}
                     </TableCell>
                     <TableCell
@@ -377,7 +393,15 @@ export function ReportsView() {
                       {row.earlyLeaveMinutes} min
                     </TableCell>
                     <TableCell className="text-right tabular-nums text-state-success">
-                      {formatMinutes(row.overtimeMinutes)}
+                      {formatMinutes(row.overtimeTier1Minutes)}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums text-state-success">
+                      {formatMinutes(row.overtimeTier2Minutes)}
+                    </TableCell>
+                    <TableCell
+                      className={`text-right tabular-nums ${row.incidentCount > 0 ? "text-state-warning" : "text-muted-foreground"}`}
+                    >
+                      {row.incidentCount}
                     </TableCell>
                   </TableRow>
                 ))}

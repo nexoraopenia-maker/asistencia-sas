@@ -13,13 +13,14 @@ import { ApiError, NetworkError, setSessionExpiredHandler } from "../api/client"
 import { authApi, type AuthenticatedUser } from "../api/endpoints";
 import {
   clearTokens,
+  getCachedUser,
   getDeviceId,
   getTokens,
   isBiometricEnabled,
+  saveCachedUser,
   saveTokens,
   setBiometricEnabled,
 } from "../lib/storage";
-import { clearQueue } from "../offline/queue";
 
 export interface BiometricSupport {
   available: boolean;
@@ -72,11 +73,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [biometricOn, setBiometricOn] = useState(false);
 
   const endSession = useCallback(async () => {
+    // La cola offline NO se borra: son horas trabajadas. Cada fila lleva su
+    // dueno y se enviara cuando esa persona vuelva a iniciar sesion.
     await clearTokens();
-    // La cola pertenece al empleado que la genero: no puede sobrevivir a un
-    // cambio de usuario en el mismo dispositivo.
-    await clearQueue();
     setUser(null);
+  }, []);
+
+  const openSession = useCallback(async (next: AuthenticatedUser) => {
+    await saveCachedUser(next);
+    setUser(next);
   }, []);
 
   // El cliente HTTP avisa cuando el refresco falla definitivamente (sesion
@@ -103,17 +108,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // guardado basta.
         if (enabled && support.available && support.enrolled) return;
 
-        setUser(await authApi.me());
+        await openSession(await authApi.me());
       } catch (error) {
         // Sin cobertura al arrancar no es motivo para echar al empleado: los
         // tokens siguen guardados y se reintentara. Solo un rechazo explicito
         // del servidor cierra la sesion.
-        if (!(error instanceof NetworkError)) await endSession();
+        if (error instanceof NetworkError) {
+          setUser(await getCachedUser<AuthenticatedUser>());
+        } else if (error instanceof ApiError && error.status === 401) {
+          await endSession();
+        }
       } finally {
         setIsRestoring(false);
       }
     })();
-  }, [endSession]);
+  }, [endSession, openSession]);
 
   const login = useCallback(async (email: string, password: string) => {
     setIsAuthenticating(true);
@@ -125,11 +134,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         accessToken: response.tokens.accessToken,
         refreshToken: response.tokens.refreshToken,
       });
-      setUser(response.user);
+      await openSession(response.user);
     } finally {
       setIsAuthenticating(false);
     }
-  }, []);
+  }, [openSession]);
 
   /**
    * Desbloqueo biometrico.
@@ -157,17 +166,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         throw new ApiError(401, "UNAUTHENTICATED", "Inicia sesion con tu correo la primera vez");
       }
 
-      const deviceId = await getDeviceId();
-      const refreshed = await authApi.biometric(tokens.refreshToken, deviceId);
-      await saveTokens({
-        accessToken: refreshed.accessToken,
-        refreshToken: refreshed.refreshToken,
-      });
-      setUser(await authApi.me());
+      try {
+        const deviceId = await getDeviceId();
+        const refreshed = await authApi.biometric(tokens.refreshToken, deviceId);
+        await saveTokens({
+          accessToken: refreshed.accessToken,
+          refreshToken: refreshed.refreshToken,
+        });
+        await openSession(await authApi.me());
+      } catch (error) {
+        // Sin red: el dispositivo ya verifico a la persona, se abre con el
+        // perfil guardado para que pueda marcar. El servidor revalidara.
+        const cached = await getCachedUser<AuthenticatedUser>();
+        if (!(error instanceof NetworkError) || !cached) throw error;
+        setUser(cached);
+      }
     } finally {
       setIsAuthenticating(false);
     }
-  }, []);
+  }, [openSession]);
 
   const logout = useCallback(async () => {
     const tokens = await getTokens();

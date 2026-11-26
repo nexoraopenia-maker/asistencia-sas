@@ -14,7 +14,6 @@ import { API_URL } from "../../src/api/client";
 import { useAuth } from "../../src/auth/AuthContext";
 import { EmployeeHeader } from "../../src/components/EmployeeHeader";
 import { BRAND_GRADIENT, colors } from "../../src/lib/theme";
-import { dismissRejections } from "../../src/offline/queue";
 import { useOffline } from "../../src/offline/OfflineContext";
 
 function Row({
@@ -53,7 +52,7 @@ function Row({
 export default function MasScreen() {
   const insets = useSafeAreaInsets();
   const { user, logout, biometric, biometricEnabled, toggleBiometric } = useAuth();
-  const { pendingCount, rejections, sync, isSyncing, refreshQueueState } = useOffline();
+  const { pendingCount, rejections, sync, isSyncing, blockedReason, dismiss } = useOffline();
 
   if (!user) return null;
 
@@ -61,7 +60,7 @@ export default function MasScreen() {
     Alert.alert(
       "Cerrar sesion",
       pendingCount > 0
-        ? `Tienes ${pendingCount} marcacion${pendingCount === 1 ? "" : "es"} sin sincronizar. Si cierras sesion ahora se perderan.`
+        ? `Tienes ${pendingCount} marcacion${pendingCount === 1 ? "" : "es"} sin sincronizar. Quedaran guardadas en este telefono y se enviaran cuando vuelvas a iniciar sesion con esta cuenta.`
         : "Se cerrara tu sesion en este dispositivo.",
       [
         { text: "Cancelar", style: "cancel" },
@@ -127,7 +126,9 @@ export default function MasScreen() {
                 ? `${pendingCount} marcacion${pendingCount === 1 ? "" : "es"} en cola`
                 : "Todo sincronizado"
             }
-            subtitle={pendingCount > 0 ? "Toca para reintentar el envio" : undefined}
+            subtitle={
+              pendingCount > 0 ? (blockedReason ?? "Toca para reintentar el envio") : undefined
+            }
             onPress={pendingCount > 0 && !isSyncing ? () => void sync() : undefined}
           />
 
@@ -147,7 +148,7 @@ export default function MasScreen() {
                     { text: "Cerrar", style: "cancel" },
                     {
                       text: "Entendido, descartar",
-                      onPress: () => void dismissRejections().then(refreshQueueState),
+                      onPress: () => void dismiss(),
                     },
                   ],
                 );

@@ -1,6 +1,10 @@
-import { db, Prisma, requireTenantContext, withAuditReason } from "@scire/database";
+import { db, Prisma, requireTenantContext, tenantData, withAuditReason } from "@scire/database";
 import {
+  addDays,
   AppError,
+  buildSessions,
+  VALID_PUNCH_TRANSITIONS,
+  type ManualPunchInput,
   Feature,
   hasFeature,
   type SubscriptionTier,
@@ -9,11 +13,13 @@ import {
   ErrorCode,
   PunchSource,
   PunchType,
-  tardinessMinutes,
-  toZonedDateString,
+  lateMinutesFrom,
+  resolveOperationalDate,
+  ShiftType,
+  shiftWindow,
   toZonedTimeString,
-  VALID_PUNCH_TRANSITIONS,
   VerificationStatus,
+  zonedLocalToUtc,
   type AdjustPunchInput,
   type BatchPunchInput,
   type BatchPunchItemResult,
@@ -32,6 +38,12 @@ import {
   objectExists,
 } from "../../lib/storage.js";
 import { emitEvent, WebhookEvent } from "../../services/webhooks.service.js";
+import {
+  findShiftSlots,
+  getPunchState,
+  loadLaborRules,
+  type CurrentPunchState,
+} from "../../services/workday.service.js";
 
 /**
  * Marcacion de asistencia.
@@ -51,6 +63,8 @@ interface PunchContext {
     id: string;
     timezone: string;
     lateToleranceMinutes: number;
+    maxShiftHours: number;
+    allowSplitShifts: boolean;
     requireSelfie: boolean;
     requireGeofence: boolean;
     faceMatchEnabled: boolean;
@@ -95,6 +109,8 @@ async function loadContext(branchId: string): Promise<PunchContext> {
         id: true,
         timezone: true,
         lateToleranceMinutes: true,
+        maxShiftHours: true,
+        allowSplitShifts: true,
         requireSelfie: true,
         requireGeofence: true,
         faceMatchEnabled: true,
@@ -134,34 +150,21 @@ function effectiveTimezone(ctx: PunchContext): string {
  * Comprueba que la secuencia de marcaciones tiene sentido.
  *
  * Sin esto, un empleado podria registrar dos entradas seguidas y acumular
- * horas que no trabajo, o cerrar un refrigerio que nunca empezo.
+ * horas que no trabajo, o cerrar un refrigerio que nunca empezo. La secuencia
+ * se evalua sobre la SESION abierta, no sobre el dia de calendario: la salida
+ * de las 02:00 cierra la entrada de las 20:00 del dia anterior.
  */
 async function assertValidSequence(
   userId: string,
-  localDate: string,
+  instant: Date,
   timezone: string,
+  company: PunchContext["company"],
   punchType: PunchType,
-): Promise<void> {
-  const dayStart = new Date(`${localDate}T00:00:00.000Z`);
-  // Se busca en una ventana de +-1 dia UTC y luego se filtra por fecha local:
-  // el offset de la zona puede desplazar la jornada a ambos lados.
-  const from = new Date(dayStart.getTime() - 86_400_000);
-  const to = new Date(dayStart.getTime() + 2 * 86_400_000);
+): Promise<CurrentPunchState> {
+  const state = await getPunchState(userId, instant, timezone, company);
 
-  const sameDay = await db.attendanceRecord.findMany({
-    where: { userId, isVoided: false, serverTimestamp: { gte: from, lte: to } },
-    select: { punchType: true, serverTimestamp: true },
-    orderBy: { serverTimestamp: "desc" },
-  });
-
-  const last = sameDay.find(
-    (record) => toZonedDateString(record.serverTimestamp, timezone) === localDate,
-  );
-
-  const previous = (last?.punchType ?? "NONE") as PunchType | "NONE";
-  const allowed = VALID_PUNCH_TRANSITIONS[previous];
-
-  if (!allowed.includes(punchType)) {
+  if (!state.allowed.includes(punchType)) {
+    const { previous, allowed } = state;
     const expected = allowed.length > 0 ? allowed.join(" o ") : "ninguna marcacion mas hoy";
     throw new AppError(
       ErrorCode.INVALID_PUNCH_SEQUENCE,
@@ -169,9 +172,38 @@ async function assertValidSequence(
       { previous, attempted: punchType, allowed },
     );
   }
+  return state;
 }
 
-/** Turno de trabajo asignado ese dia, si lo hay. Es la referencia de puntualidad. */
+/**
+ * Turno de referencia y tardanza de una marcacion dentro de su jornada.
+ * Para una entrada se compara contra el INSTANTE de inicio del turno, de modo
+ * que llegar a las 00:10 a un turno de las 23:00 son 70 minutos y no cero.
+ */
+export function matchShift(
+  state: CurrentPunchState,
+  punchType: PunchType,
+  instant: Date,
+  timezone: string,
+  lateToleranceMinutes: number,
+): { shiftId: string | null; tardiness: number } {
+  const sameDate = state.shifts.filter((s) => s.date === state.operationalDate);
+  if (punchType === PunchType.IN) {
+    const match = resolveOperationalDate(instant, timezone, state.shifts);
+    const shift = match.date === state.operationalDate ? match.shift : null;
+    if (!shift) return { shiftId: null, tardiness: 0 };
+    const { start } = shiftWindow(shift.date, shift.startTime, shift.endTime, timezone);
+    return {
+      shiftId: shift.id ?? null,
+      tardiness: lateMinutesFrom(instant, start, lateToleranceMinutes),
+    };
+  }
+  const isLunch = punchType === PunchType.LUNCH_START || punchType === PunchType.LUNCH_END;
+  const shift = sameDate.find((s) => s.type === (isLunch ? ShiftType.LUNCH : ShiftType.WORK));
+  return { shiftId: shift?.id ?? null, tardiness: 0 };
+}
+
+/** Turno de un tipo asignado en una fecha operativa, si lo hay. */
 export async function findShift(userId: string, localDate: string, type: "WORK" | "LUNCH") {
   return db.shift.findFirst({
     where: { userId, date: new Date(`${localDate}T00:00:00.000Z`), type },
@@ -228,11 +260,15 @@ export async function evaluatePunch(
   }
 
   const skew = clockSkewSeconds(deviceTimestamp, now);
-  const localDate = toZonedDateString(serverTimestamp, timezone);
-  const localTime = toZonedTimeString(serverTimestamp, timezone);
 
   // --- Secuencia ----------------------------------------------------------
-  await assertValidSequence(userId, localDate, timezone, input.punchType);
+  const state = await assertValidSequence(
+    userId,
+    serverTimestamp,
+    timezone,
+    ctx.company,
+    input.punchType,
+  );
 
   // --- Geocerca -----------------------------------------------------------
   const geofence = checkGeofence({
@@ -290,16 +326,13 @@ export async function evaluatePunch(
   }
 
   // --- Puntualidad --------------------------------------------------------
-  let tardiness = 0;
-  let shiftId: string | null = null;
-  const isLunch = input.punchType === PunchType.LUNCH_START || input.punchType === PunchType.LUNCH_END;
-  const shift = await findShift(userId, localDate, isLunch ? "LUNCH" : "WORK");
-  if (shift) {
-    shiftId = shift.id;
-    if (input.punchType === PunchType.IN) {
-      tardiness = tardinessMinutes(shift.startTime, localTime, ctx.company.lateToleranceMinutes);
-    }
-  }
+  const { shiftId, tardiness } = matchShift(
+    state,
+    input.punchType,
+    serverTimestamp,
+    timezone,
+    ctx.company.lateToleranceMinutes,
+  );
 
   // --- Estado de verificacion --------------------------------------------
   // El face-match (FASE 7) rellenara faceMatchScore de forma asincrona; hasta
@@ -525,14 +558,19 @@ export async function createPunchBatch(
   return { results, created, duplicates, rejected };
 }
 
-/** Marcaciones del dia en curso del propio empleado (modal "Detalle del Turno"). */
+/**
+ * Marcaciones de la jornada en curso del propio empleado (modal "Detalle del
+ * Turno"). Si hay una sesion abierta que empezo ayer, es esa la jornada.
+ */
 export async function getTodayPunches(userId: string, timezone: string) {
-  const now = new Date();
-  const today = toZonedDateString(now, timezone);
-  const from = new Date(now.getTime() - 2 * 86_400_000);
+  const rules = await loadLaborRules();
+  const state = await getPunchState(userId, new Date(), timezone, rules);
+  const ids = state.sessions
+    .filter((session) => session.operationalDate === state.operationalDate)
+    .flatMap((session) => session.punches.map((punch) => punch.id!));
 
   const records = await db.attendanceRecord.findMany({
-    where: { userId, isVoided: false, serverTimestamp: { gte: from } },
+    where: { userId, id: { in: ids } },
     select: {
       id: true,
       punchType: true,
@@ -545,17 +583,15 @@ export async function getTodayPunches(userId: string, timezone: string) {
     orderBy: { serverTimestamp: "asc" },
   });
 
-  return records
-    .filter((record) => toZonedDateString(record.serverTimestamp, timezone) === today)
-    .map((record) => ({
-      id: record.id,
-      punchType: record.punchType,
-      time: toZonedTimeString(record.serverTimestamp, timezone),
-      serverTimestamp: record.serverTimestamp.toISOString(),
-      isVerified: record.verificationStatus === VerificationStatus.VERIFIED,
-      hasAlert: record.isMockLocation || record.isWithinGeofence === false,
-      tardinessMinutes: record.tardinessMinutes,
-    }));
+  return records.map((record) => ({
+    id: record.id,
+    punchType: record.punchType,
+    time: toZonedTimeString(record.serverTimestamp, timezone),
+    serverTimestamp: record.serverTimestamp.toISOString(),
+    isVerified: record.verificationStatus === VerificationStatus.VERIFIED,
+    hasAlert: record.isMockLocation || record.isWithinGeofence === false,
+    tardinessMinutes: record.tardinessMinutes,
+  }));
 }
 
 export interface ListPunchesQuery {
@@ -570,14 +606,19 @@ export interface ListPunchesQuery {
 
 /** Feed del dashboard de RRHH. */
 export async function listPunches(query: ListPunchesQuery) {
+  // `from`/`to` son fechas de la empresa: en Lima, el dia termina a las 05:00
+  // UTC del siguiente. Filtrar por fecha UTC esconderia el turno noche.
+  const { timezone } = await loadLaborRules();
   const where: Prisma.AttendanceRecordWhereInput = {
     ...(query.userId ? { userId: query.userId } : {}),
     ...(query.branchId ? { branchId: query.branchId } : {}),
     ...(query.from || query.to
       ? {
           serverTimestamp: {
-            ...(query.from ? { gte: new Date(`${query.from}T00:00:00.000Z`) } : {}),
-            ...(query.to ? { lte: new Date(`${query.to}T23:59:59.999Z`) } : {}),
+            ...(query.from ? { gte: zonedLocalToUtc(query.from, "00:00:00", timezone) } : {}),
+            ...(query.to
+              ? { lt: zonedLocalToUtc(addDays(query.to, 1), "00:00:00", timezone) }
+              : {}),
           },
         }
       : {}),
@@ -706,4 +747,128 @@ export async function voidPunch(input: VoidPunchInput, actorUserId: string) {
       select: { id: true, isVoided: true, voidedAt: true },
     }),
   );
+}
+
+/**
+ * Regularizacion de RRHH: crea una marcacion que falta.
+ *
+ * Se valida sobre la sesion resultante y no sobre "la ultima marcacion": lo
+ * normal es insertar una salida en medio del historial, dias despues.
+ */
+export async function createManualPunch(input: ManualPunchInput, actorUserId: string) {
+  const rules = await loadLaborRules();
+  const user = await db.user.findUnique({
+    where: { id: input.userId },
+    select: { id: true, branchId: true },
+  });
+  if (!user) throw new AppError(ErrorCode.NOT_FOUND, "Empleado no encontrado en tu empresa");
+
+  const branchId = input.branchId ?? user.branchId;
+  if (!branchId) {
+    throw new AppError(ErrorCode.VALIDATION_ERROR, "Indica la sucursal de la marcacion");
+  }
+  const branch = await db.branch.findUnique({
+    where: { id: branchId },
+    select: { timezone: true },
+  });
+  if (!branch) throw new AppError(ErrorCode.NOT_FOUND, "La sucursal indicada no existe");
+
+  const timezone = branch.timezone ?? rules.timezone;
+  const time = input.time.length === 5 ? `${input.time}:00` : input.time;
+  const instant = zonedLocalToUtc(input.date, time, timezone);
+  if (instant.getTime() > Date.now()) {
+    throw new AppError(ErrorCode.VALIDATION_ERROR, "No se puede registrar una marcacion futura");
+  }
+
+  const margin = (rules.maxShiftHours + 48) * 3_600_000;
+  const [records, shifts] = await Promise.all([
+    db.attendanceRecord.findMany({
+      where: {
+        userId: user.id,
+        isVoided: false,
+        serverTimestamp: {
+          gte: new Date(instant.getTime() - margin),
+          lte: new Date(instant.getTime() + margin),
+        },
+      },
+      select: { id: true, punchType: true, serverTimestamp: true },
+    }),
+    findShiftSlots(user.id, addDays(input.date, -4), input.date),
+  ]);
+
+  const CANDIDATE = "candidate";
+  const sessions = buildSessions(
+    [
+      ...records.map((r) => ({ id: r.id, punchType: r.punchType, at: r.serverTimestamp })),
+      { id: CANDIDATE, punchType: input.punchType, at: instant },
+    ],
+    {
+      maxShiftHours: rules.maxShiftHours,
+      now: new Date(),
+      operationalDateFor: (at) => resolveOperationalDate(at, timezone, shifts).date,
+    },
+  );
+  const session = sessions.find((s) => s.punches.some((p) => p.id === CANDIDATE))!;
+  const types = session.punches.map((p) => p.punchType as PunchType);
+  const isOrdered = types.every((type, i) =>
+    VALID_PUNCH_TRANSITIONS[i === 0 ? "NONE" : types[i - 1]!].includes(type),
+  );
+  if (session.status === "ORPHAN" || !isOrdered) {
+    throw new AppError(
+      ErrorCode.INVALID_PUNCH_SEQUENCE,
+      `La marcacion no encaja en la jornada (quedaria: ${types.join(", ")}). Revisa la hora o anula la marcacion erronea.`,
+    );
+  }
+
+  const shift = resolveOperationalDate(instant, timezone, shifts);
+  const sameDate = shifts.filter((s) => s.date === session.operationalDate);
+  const isLunch = input.punchType === PunchType.LUNCH_START || input.punchType === PunchType.LUNCH_END;
+  const matched = sameDate.find((s) => s.type === (isLunch ? ShiftType.LUNCH : ShiftType.WORK));
+  const tardiness =
+    input.punchType === PunchType.IN && shift.window && shift.date === session.operationalDate
+      ? lateMinutesFrom(instant, shift.window.start, rules.lateToleranceMinutes)
+      : 0;
+
+  let record;
+  try {
+    record = await db.attendanceRecord.create({
+      data: tenantData<Prisma.AttendanceRecordUncheckedCreateInput>({
+        userId: user.id,
+        branchId,
+        shiftId: matched?.id ?? null,
+        punchType: input.punchType,
+        source: PunchSource.MANUAL,
+        serverTimestamp: instant,
+        deviceTimestamp: instant,
+        verificationStatus: VerificationStatus.MANUAL_OVERRIDE,
+        tardinessMinutes: tardiness,
+        clientPunchId: `manual:${user.id}:${instant.getTime() / 1000}:${input.punchType}`,
+        notes: `Regularizacion de RRHH: ${input.reason}`,
+      }),
+      select: { id: true, punchType: true, serverTimestamp: true, tardinessMinutes: true },
+    });
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+      throw new AppError(ErrorCode.DUPLICATE_PUNCH, "Esa marcacion ya fue regularizada");
+    }
+    throw error;
+  }
+
+  // La extension de auditoria solo cubre cambios; el alta manual se deja aqui.
+  await db.auditLog.create({
+    data: tenantData<Prisma.AuditLogUncheckedCreateInput & { companyId: string }>({
+      entityType: "AttendanceRecord",
+      recordId: record.id,
+      action: "CREATE",
+      modifiedByUserId: actorUserId,
+      newValue: {
+        userId: user.id,
+        punchType: input.punchType,
+        serverTimestamp: instant.toISOString(),
+      },
+      reason: input.reason,
+    }),
+  });
+
+  return { ...record, serverTimestamp: record.serverTimestamp.toISOString() };
 }

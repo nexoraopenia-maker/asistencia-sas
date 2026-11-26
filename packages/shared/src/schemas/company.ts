@@ -6,6 +6,7 @@ import {
   latitudeSchema,
   longitudeSchema,
   phoneSchema,
+  timeStringSchema,
   timezoneSchema,
 } from "./common.js";
 
@@ -33,6 +34,26 @@ export const updateCompanySchema = z.object({
    * pretende evitar.
    */
   dataRetentionMonths: z.number().int().min(1).max(120).optional(),
+
+  // --- Jornada y calculo laboral -------------------------------------------
+  maxShiftHours: z.number().int().min(6).max(36).optional(),
+  allowSplitShifts: z.boolean().optional(),
+  dailyOrdinaryMinutes: z.number().int().min(60).max(1_440).optional(),
+  weeklyOrdinaryMinutes: z.number().int().min(60).max(10_080).optional(),
+  overtimeThresholdMinutes: z.number().int().min(0).max(120).optional(),
+  overtimeTier1Minutes: z.number().int().min(0).max(720).optional(),
+  overtimeTier1RatePct: z.number().int().min(0).max(300).optional(),
+  overtimeTier2RatePct: z.number().int().min(0).max(300).optional(),
+  nightStartTime: timeStringSchema.optional(),
+  nightEndTime: timeStringSchema.optional(),
+  nightSurchargePct: z.number().int().min(0).max(300).optional(),
+  nightShiftMinSharePct: z.number().int().min(1).max(100).optional(),
+  minimumWage: z.number().positive().max(99_999_999).nullable().optional(),
+  hourlyDivisor: z.number().int().min(1).max(744).optional(),
+  payrollCurrency: z
+    .string()
+    .regex(/^[A-Z]{3}$/, "Codigo de moneda ISO 4217 (PEN, USD...)")
+    .optional(),
 });
 export type UpdateCompanyInput = z.infer<typeof updateCompanySchema>;
 

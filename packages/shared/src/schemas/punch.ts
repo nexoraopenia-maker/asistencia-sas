@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { PunchSource, PunchType, VerificationStatus } from "../enums.js";
-import { idSchema, latitudeSchema, longitudeSchema } from "./common.js";
+import { dateStringSchema, idSchema, latitudeSchema, longitudeSchema } from "./common.js";
 
 const punchTypeSchema = z.nativeEnum(PunchType);
 
@@ -134,3 +134,17 @@ export const voidPunchSchema = z.object({
   reason: z.string().trim().min(10).max(500),
 });
 export type VoidPunchInput = z.infer<typeof voidPunchSchema>;
+
+/**
+ * Regularizacion de RRHH: registra una marcacion que falta (tipicamente una
+ * salida olvidada). La fecha y hora son LOCALES de la sucursal.
+ */
+export const manualPunchSchema = z.object({
+  userId: idSchema,
+  branchId: idSchema.optional(),
+  punchType: punchTypeSchema,
+  date: dateStringSchema,
+  time: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/, "Hora invalida (HH:mm)"),
+  reason: z.string().trim().min(10, "Explica el motivo (minimo 10 caracteres)").max(500),
+});
+export type ManualPunchInput = z.infer<typeof manualPunchSchema>;

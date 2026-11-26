@@ -10,8 +10,22 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { countPending, enqueuePunch, listRejections, type RejectedPunch } from "./queue";
+import { AppState } from "react-native";
+import { useAuth } from "../auth/AuthContext";
+import {
+  dismissRejections,
+  enqueuePunch,
+  listPending,
+  listRejections,
+  type QueuedPunch,
+  type RejectedPunch,
+} from "./queue";
 import { syncPendingPunches, type SyncResult } from "./sync";
+
+/** Cada cuanto se reintenta mientras queden marcaciones por enviar. */
+const RETRY_INTERVAL_MS = 60_000;
+/** Cuanto se muestra la confirmacion de "sincronizadas". */
+const SYNCED_NOTICE_MS = 6_000;
 
 /**
  * Estado de conectividad y de la cola offline, compartido por toda la app.
@@ -21,74 +35,130 @@ import { syncPendingPunches, type SyncResult } from "./sync";
  */
 interface OfflineContextValue {
   isOnline: boolean;
+  /** Marcaciones guardadas en el dispositivo y aun no enviadas. */
+  pending: QueuedPunch[];
   pendingCount: number;
   isSyncing: boolean;
+  /** Enviadas en la ultima sincronizacion (para confirmarlo en pantalla). */
+  justSynced: number;
+  /** Por que siguen en cola, si el servidor lo explico. */
+  blockedReason: string | null;
   rejections: RejectedPunch[];
   /** Guarda una marcacion en la cola local. */
   queuePunch: (payload: CreatePunchInput, photoUri: string | null) => Promise<void>;
-  /** Fuerza un intento de sincronizacion (pull-to-refresh, boton manual). */
+  /** Fuerza un intento de sincronizacion. */
   sync: () => Promise<SyncResult | null>;
-  refreshQueueState: () => Promise<void>;
+  dismiss: () => Promise<void>;
 }
 
 const OfflineContext = createContext<OfflineContextValue | null>(null);
 
 export function OfflineProvider({ children }: { children: ReactNode }) {
+  const { user } = useAuth();
+  const userId = user?.id ?? null;
   const [isOnline, setIsOnline] = useState(true);
-  const [pendingCount, setPendingCount] = useState(0);
+  const [pending, setPending] = useState<QueuedPunch[]>([]);
   const [isSyncing, setIsSyncing] = useState(false);
+  const [justSynced, setJustSynced] = useState(0);
+  const [blockedReason, setBlockedReason] = useState<string | null>(null);
   const [rejections, setRejections] = useState<RejectedPunch[]>([]);
-  const wasOffline = useRef(false);
+  const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const refreshQueueState = useCallback(async () => {
-    const [count, rejected] = await Promise.all([countPending(), listRejections()]);
-    setPendingCount(count);
+    if (!userId) {
+      setPending([]);
+      setRejections([]);
+      return;
+    }
+    const [queued, rejected] = await Promise.all([listPending(userId), listRejections(userId)]);
+    setPending(queued);
     setRejections(rejected);
-  }, []);
+  }, [userId]);
 
   const sync = useCallback(async () => {
+    // Sin sesion no se envia nada: las filas son de un empleado concreto.
+    if (!userId) return null;
     setIsSyncing(true);
     try {
-      const result = await syncPendingPunches();
-      await refreshQueueState();
+      const result = await syncPendingPunches(userId);
+      setBlockedReason(result.blockedReason);
+      const sent = result.synced + result.duplicates;
+      if (sent > 0) {
+        setJustSynced(sent);
+        if (noticeTimer.current) clearTimeout(noticeTimer.current);
+        noticeTimer.current = setTimeout(() => setJustSynced(0), SYNCED_NOTICE_MS);
+      }
       return result;
+    } catch (error) {
+      console.error("[sync] fallo inesperado", error);
+      return null;
     } finally {
+      await refreshQueueState();
       setIsSyncing(false);
     }
-  }, [refreshQueueState]);
+  }, [userId, refreshQueueState]);
+
+  // Al abrir la app o iniciar sesion.
+  useEffect(() => {
+    void refreshQueueState().then(sync);
+  }, [refreshQueueState, sync]);
 
   useEffect(() => {
-    void refreshQueueState();
-
-    const unsubscribe = NetInfo.addEventListener((state) => {
+    let wasOnline: boolean | null = null;
+    const unsubscribeNet = NetInfo.addEventListener((state) => {
       // `isInternetReachable` puede ser null mientras se comprueba: se toma
       // como "hay red" para no marcar la app como offline en cada arranque.
       const online = Boolean(state.isConnected) && state.isInternetReachable !== false;
       setIsOnline(online);
-
-      // Solo se sincroniza en la TRANSICION de sin red a con red. NetInfo
-      // emite eventos con frecuencia (cambio de wifi a datos, cambio de
-      // intensidad) y disparar un lote en cada uno seria ruido.
-      if (online && wasOffline.current) {
-        void sync();
-      }
-      wasOffline.current = !online;
+      // Solo en la TRANSICION a con red: NetInfo emite eventos muy a menudo.
+      if (online && wasOnline === false) void sync();
+      wasOnline = online;
     });
+    const appState = AppState.addEventListener("change", (status) => {
+      if (status === "active") void sync();
+    });
+    return () => {
+      unsubscribeNet();
+      appState.remove();
+    };
+  }, [sync]);
 
-    return unsubscribe;
-  }, [refreshQueueState, sync]);
+  // Hay red pero el envio fallo (servidor caido, limite de peticiones).
+  useEffect(() => {
+    if (!isOnline || pending.length === 0) return;
+    const timer = setInterval(() => void sync(), RETRY_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [isOnline, pending.length, sync]);
 
   const queuePunch = useCallback(
     async (payload: CreatePunchInput, photoUri: string | null) => {
-      await enqueuePunch(payload, photoUri);
+      if (!userId) throw new Error("Inicia sesion para marcar");
+      await enqueuePunch(userId, payload, photoUri);
       await refreshQueueState();
     },
-    [refreshQueueState],
+    [userId, refreshQueueState],
   );
 
+  const dismiss = useCallback(async () => {
+    if (!userId) return;
+    await dismissRejections(userId);
+    await refreshQueueState();
+  }, [userId, refreshQueueState]);
+
   const value = useMemo(
-    () => ({ isOnline, pendingCount, isSyncing, rejections, queuePunch, sync, refreshQueueState }),
-    [isOnline, pendingCount, isSyncing, rejections, queuePunch, sync, refreshQueueState],
+    () => ({
+      isOnline,
+      pending,
+      pendingCount: pending.length,
+      isSyncing,
+      justSynced,
+      blockedReason,
+      rejections,
+      queuePunch,
+      sync,
+      dismiss,
+    }),
+    [isOnline, pending, isSyncing, justSynced, blockedReason, rejections, queuePunch, sync, dismiss],
   );
 
   return <OfflineContext.Provider value={value}>{children}</OfflineContext.Provider>;

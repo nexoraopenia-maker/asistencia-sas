@@ -12,6 +12,7 @@ import {
   toZonedWeekday,
   weekDaysFrom,
   zonedLocalToUtc,
+  periodPresets,
 } from "./time.js";
 
 describe("validacion de HH:mm:ss", () => {
@@ -143,5 +144,23 @@ describe("zonedLocalToUtc", () => {
     const instant = zonedLocalToUtc("2026-11-25", "00:00:05", "America/Bogota");
     expect(toZonedDateString(instant, "America/Bogota")).toBe("2026-11-25");
     expect(toZonedTimeString(instant, "America/Bogota")).toBe("00:00:05");
+  });
+});
+
+describe("periodPresets", () => {
+  const by = (today: string) =>
+    Object.fromEntries(periodPresets(today).map((p) => [p.key, [p.from, p.to]]));
+
+  it("calcula quincenas y meses, incluido el cambio de ano", () => {
+    expect(by("2026-01-10")).toMatchObject({
+      fortnight1: ["2026-01-01", "2026-01-15"],
+      fortnight2: ["2026-01-16", "2026-01-31"],
+      lastMonth: ["2025-12-01", "2025-12-31"],
+    });
+    expect(by("2026-02-20").fortnight2).toEqual(["2026-02-16", "2026-02-28"]);
+  });
+
+  it("la semana empieza en lunes", () => {
+    expect(by("2026-11-29").week).toEqual(["2026-11-23", "2026-11-29"]);
   });
 });

@@ -15,6 +15,12 @@ import { Router } from "express";
 import { asyncHandler, ok, parseBody } from "../../lib/http.js";
 import { getRetentionStatus, purgeExpiredBiometrics } from "../../services/retention.service.js";
 import { requireRole } from "../../middleware/auth.js";
+import { LABOR_RULES_SELECT } from "../../services/workday.service.js";
+
+/** Decimal de Prisma -> numero, para que el JSON no lo envie como texto. */
+function serializeCompany<T extends { minimumWage: { toString(): string } | null }>(company: T) {
+  return { ...company, minimumWage: company.minimumWage === null ? null : Number(company.minimumWage) };
+}
 
 /**
  * Empresa y sucursales.
@@ -30,15 +36,13 @@ const COMPANY_SELECT = {
   name: true,
   slug: true,
   taxId: true,
-  timezone: true,
   logoUrl: true,
-  lateToleranceMinutes: true,
-  earlyLeaveToleranceMinutes: true,
   requireSelfie: true,
   requireGeofence: true,
   faceMatchEnabled: true,
   faceMatchMinScore: true,
   dataRetentionMonths: true,
+  ...LABOR_RULES_SELECT,
   tier: true,
   maxEmployees: true,
   accountStatus: true,
@@ -48,13 +52,11 @@ const COMPANY_SELECT = {
 companyRouter.get(
   "/",
   asyncHandler(async (req, res) => {
-    ok(
-      res,
-      await db.company.findUniqueOrThrow({
-        where: { id: req.auth!.companyId },
-        select: COMPANY_SELECT,
-      }),
-    );
+    const company = await db.company.findUniqueOrThrow({
+      where: { id: req.auth!.companyId },
+      select: COMPANY_SELECT,
+    });
+    ok(res, serializeCompany(company));
   }),
 );
 
@@ -81,14 +83,12 @@ companyRouter.patch(
       }
     }
 
-    ok(
-      res,
-      await db.company.update({
-        where: { id: req.auth!.companyId },
-        data: input,
-        select: COMPANY_SELECT,
-      }),
-    );
+    const company = await db.company.update({
+      where: { id: req.auth!.companyId },
+      data: input,
+      select: COMPANY_SELECT,
+    });
+    ok(res, serializeCompany(company));
   }),
 );
 

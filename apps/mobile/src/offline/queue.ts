@@ -1,5 +1,9 @@
 import type { CreatePunchInput } from "@scire/shared";
+import { copyAsync, documentDirectory, makeDirectoryAsync } from "expo-file-system/legacy";
 import * as SQLite from "expo-sqlite";
+import type { QueuedPunch, RejectedPunch } from "./syncCore";
+
+export type { QueuedPunch, RejectedPunch } from "./syncCore";
 
 /**
  * Cola local de marcaciones pendientes.
@@ -10,27 +14,12 @@ import * as SQLite from "expo-sqlite";
  * misma marcacion si la app se cierra a mitad de encolado; AsyncStorage
  * obligaria a leer-modificar-escribir un JSON entero, con una ventana de
  * corrupcion en cada guardado.
+ *
+ * Cada fila pertenece a un empleado (`userId`). La cola SOBREVIVE al cierre de
+ * sesion y a la caducidad del token: solo su dueno puede verla y enviarla.
  */
 
 const DB_NAME = "scire-chronos.db";
-
-export interface QueuedPunch {
-  clientPunchId: string;
-  payload: CreatePunchInput;
-  /** URI local de la selfie, si aun no se ha podido subir al bucket. */
-  photoUri: string | null;
-  createdAt: number;
-  attempts: number;
-  lastError: string | null;
-}
-
-export interface RejectedPunch {
-  clientPunchId: string;
-  punchType: string;
-  occurredAt: number;
-  errorCode: string;
-  errorMessage: string;
-}
 
 interface PendingRow {
   clientPunchId: string;
@@ -71,32 +60,67 @@ async function getDb(): Promise<SQLite.SQLiteDatabase> {
         errorCode     TEXT NOT NULL,
         errorMessage  TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS kv (
+        key   TEXT PRIMARY KEY NOT NULL,
+        value TEXT NOT NULL
+      );
     `);
+    // Instalaciones previas: las tablas existian sin dueno.
+    for (const table of ["pending_punches", "rejected_punches"]) {
+      const columns = await db.getAllAsync<{ name: string }>(`PRAGMA table_info(${table})`);
+      if (!columns.some((c) => c.name === "userId")) {
+        await db.execAsync(`ALTER TABLE ${table} ADD COLUMN userId TEXT`);
+      }
+    }
     return db;
   })();
   return dbPromise;
 }
 
+/**
+ * La camara deja la foto en la cache, que el sistema puede vaciar cuando
+ * quiera: se copia a documentos, que persiste hasta que la app la borre.
+ */
+async function persistPhoto(clientPunchId: string, photoUri: string): Promise<string> {
+  try {
+    const dir = `${documentDirectory}punch-photos/`;
+    await makeDirectoryAsync(dir, { intermediates: true });
+    const target = `${dir}${clientPunchId}.jpg`;
+    await copyAsync({ from: photoUri, to: target });
+    return target;
+  } catch {
+    // Mejor encolar con la ruta temporal que perder la marcacion.
+    return photoUri;
+  }
+}
+
 export async function enqueuePunch(
+  userId: string,
   payload: CreatePunchInput,
   photoUri: string | null,
 ): Promise<void> {
   const db = await getDb();
+  const storedPhoto = photoUri ? await persistPhoto(payload.clientPunchId, photoUri) : null;
   await db.runAsync(
     `INSERT OR REPLACE INTO pending_punches
-       (clientPunchId, payload, photoUri, createdAt, attempts, lastError)
-     VALUES (?, ?, ?, ?, 0, NULL)`,
+       (clientPunchId, payload, photoUri, createdAt, attempts, lastError, userId)
+     VALUES (?, ?, ?, ?, 0, NULL, ?)`,
     payload.clientPunchId,
     JSON.stringify(payload),
-    photoUri,
+    storedPhoto,
     Date.now(),
+    userId,
   );
 }
 
-export async function listPending(): Promise<QueuedPunch[]> {
+/** Filas sin dueno (version anterior) se atribuyen a quien este conectado. */
+const OWNED = "(userId = ? OR userId IS NULL)";
+
+export async function listPending(userId: string): Promise<QueuedPunch[]> {
   const db = await getDb();
   const rows = await db.getAllAsync<PendingRow>(
-    `SELECT * FROM pending_punches ORDER BY createdAt ASC`,
+    `SELECT * FROM pending_punches WHERE ${OWNED} ORDER BY createdAt ASC`,
+    userId,
   );
   return rows.map((row) => ({
     clientPunchId: row.clientPunchId,
@@ -106,14 +130,6 @@ export async function listPending(): Promise<QueuedPunch[]> {
     attempts: row.attempts,
     lastError: row.lastError,
   }));
-}
-
-export async function countPending(): Promise<number> {
-  const db = await getDb();
-  const row = await db.getFirstAsync<{ total: number }>(
-    `SELECT COUNT(*) AS total FROM pending_punches`,
-  );
-  return row?.total ?? 0;
 }
 
 /** Guarda la clave del objeto una vez subida la selfie, para no re-subirla. */
@@ -129,7 +145,7 @@ export async function attachSelfieKey(clientPunchId: string, objectKey: string):
   payload.selfieObjectKey = objectKey;
 
   await db.runAsync(
-    `UPDATE pending_punches SET payload = ?, photoUri = NULL WHERE clientPunchId = ?`,
+    `UPDATE pending_punches SET payload = ? WHERE clientPunchId = ?`,
     JSON.stringify(payload),
     clientPunchId,
   );
@@ -159,34 +175,46 @@ export async function removePending(clientPunchIds: string[]): Promise<void> {
  * nunca va a tener exito por reintentarla: sale de la cola y pasa aqui, para
  * que el empleado sepa que ocurrio en vez de verla desaparecer.
  */
-export async function recordRejection(rejection: RejectedPunch): Promise<void> {
+export async function recordRejection(userId: string, rejection: RejectedPunch): Promise<void> {
   const db = await getDb();
   await db.runAsync(
     `INSERT OR REPLACE INTO rejected_punches
-       (clientPunchId, punchType, occurredAt, errorCode, errorMessage)
-     VALUES (?, ?, ?, ?, ?)`,
+       (clientPunchId, punchType, occurredAt, errorCode, errorMessage, userId)
+     VALUES (?, ?, ?, ?, ?, ?)`,
     rejection.clientPunchId,
     rejection.punchType,
     rejection.occurredAt,
     rejection.errorCode,
     rejection.errorMessage,
+    userId,
   );
 }
 
-export async function listRejections(): Promise<RejectedPunch[]> {
+export async function listRejections(userId: string): Promise<RejectedPunch[]> {
   const db = await getDb();
   return db.getAllAsync<RejectedRow>(
-    `SELECT * FROM rejected_punches ORDER BY occurredAt DESC LIMIT 20`,
+    `SELECT * FROM rejected_punches WHERE ${OWNED} ORDER BY occurredAt DESC LIMIT 20`,
+    userId,
   );
 }
 
-export async function dismissRejections(): Promise<void> {
+export async function dismissRejections(userId: string): Promise<void> {
   const db = await getDb();
-  await db.runAsync(`DELETE FROM rejected_punches`);
+  await db.runAsync(`DELETE FROM rejected_punches WHERE ${OWNED}`, userId);
 }
 
-/** Vacia todo. Se llama al cerrar sesion: la cola es de un empleado concreto. */
-export async function clearQueue(): Promise<void> {
+/** Cache local (calendario) para que la app funcione al abrirse sin red. */
+export async function writeCache(key: string, value: unknown): Promise<void> {
   const db = await getDb();
-  await db.execAsync(`DELETE FROM pending_punches; DELETE FROM rejected_punches;`);
+  await db.runAsync(
+    `INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)`,
+    key,
+    JSON.stringify(value),
+  );
+}
+
+export async function readCache<T>(key: string): Promise<T | null> {
+  const db = await getDb();
+  const row = await db.getFirstAsync<{ value: string }>(`SELECT value FROM kv WHERE key = ?`, key);
+  return row ? (JSON.parse(row.value) as T) : null;
 }

@@ -1,7 +1,7 @@
 import { formatDuration, toZonedDateString, type PunchType } from "@scire/shared";
 import { LinearGradient } from "expo-linear-gradient";
 import { ChevronRight, Clock, Fingerprint, UtensilsCrossed } from "lucide-react-native";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { RefreshControl, ScrollView, Text, View, Pressable } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useAuth } from "../../src/auth/AuthContext";
@@ -26,8 +26,8 @@ const NEXT_PUNCH_LABEL: Record<PunchType, string> = {
 export default function HomeScreen() {
   const { user } = useAuth();
   const insets = useSafeAreaInsets();
-  const { schedule, isLoading, error, reload } = useWeeklySchedule();
-  const { pendingCount } = useOffline();
+  const { schedule, staleSince, isLoading, error, reload } = useWeeklySchedule();
+  const { pending, pendingCount } = useOffline();
 
   const today = toZonedDateString(new Date(), "America/Lima");
   const [selectedDate, setSelectedDate] = useState(today);
@@ -44,15 +44,26 @@ export default function HomeScreen() {
     [schedule, today],
   );
 
-  const pendingPunch = nextPunchType(todayDay);
+  const pendingPunch = nextPunchType(todayDay, schedule?.currentJornada, {
+    pending: pending.map((p) => ({
+      punchType: p.payload.punchType,
+      at: Date.parse(p.payload.deviceTimestamp),
+    })),
+    staleSince,
+  });
+
+  // Al vaciarse la cola (o crecer) el calendario del servidor cambia.
+  useEffect(() => {
+    void reload();
+  }, [pendingCount, reload]);
   const status = selectedDay ? STATUS_STYLES[selectedDay.status] : null;
 
   const handlePunchResult = (outcome: PunchOutcome) => {
     setPunchOpen(false);
     setFeedback(
       outcome.kind === "submitted"
-        ? `Marcacion registrada a las ${outcome.result.serverTimestamp.slice(11, 19)}`
-        : "Marcacion guardada. Se enviara sola al recuperar conexion.",
+        ? `Marcacion registrada a las ${new Date(outcome.result.serverTimestamp).toLocaleTimeString("es-PE")}`
+        : "Marcacion guardada en este telefono. Se enviara sola cuando haya conexion.",
     );
     void reload();
     setTimeout(() => setFeedback(null), 4000);

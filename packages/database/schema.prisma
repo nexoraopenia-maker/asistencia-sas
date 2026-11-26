@@ -174,6 +174,46 @@ model Company {
   /// biometricos varia por pais y por convenio.
   dataRetentionMonths Int @default(12)
 
+  // --- Jornada y calculo laboral (valores por defecto: Peru, regimen general
+  // privado, D.S. 007-2002-TR). Todo es configurable porque el producto es
+  // multi-rubro y multi-pais: ninguna regla legal vive escrita en el codigo.
+  /// Horas que una jornada abierta espera su salida. Una entrada sin salida
+  /// pasado este plazo se cierra como incidencia "salida faltante" y la
+  /// siguiente marcacion abre jornada nueva. Es lo que permite que una salida
+  /// a las 02:00 se vincule a la entrada de las 20:00 del dia anterior.
+  maxShiftHours            Int      @default(16)
+  /// Permite varias entradas/salidas en la misma fecha operativa (turno
+  /// partido) aunque el empleado no tenga varios turnos asignados ese dia.
+  allowSplitShifts         Boolean  @default(false)
+  /// Jornada ordinaria de referencia cuando el dia no tiene turno asignado.
+  dailyOrdinaryMinutes     Int      @default(480)
+  /// Jornada ordinaria semanal maxima (48 h en Peru).
+  weeklyOrdinaryMinutes    Int      @default(2880)
+  /// Exceso diario por debajo de este umbral no computa como sobretiempo.
+  overtimeThresholdMinutes Int      @default(0)
+  /// Minutos del primer tramo de sobretiempo (las "dos primeras horas").
+  overtimeTier1Minutes     Int      @default(120)
+  /// Sobretasa del primer tramo, en % sobre el valor hora (minimo legal Peru: 25).
+  overtimeTier1RatePct     Int      @default(25)
+  /// Sobretasa desde el segundo tramo, en % (minimo legal Peru: 35).
+  overtimeTier2RatePct     Int      @default(35)
+  /// Inicio y fin del horario nocturno, hora local `HH:mm:ss`.
+  nightStartTime           String   @default("22:00:00") @db.VarChar(8)
+  nightEndTime             String   @default("06:00:00") @db.VarChar(8)
+  /// Sobretasa nocturna en % sobre la RMV (minimo legal Peru: 35).
+  nightSurchargePct        Int      @default(35)
+  /// % minimo de la jornada en horario nocturno para tratarla como "jornada
+  /// nocturna" en el reporte. Criterio interno configurable: validalo con tu
+  /// asesor laboral.
+  nightShiftMinSharePct    Int      @default(50)
+  /// Remuneracion Minima Vital vigente. Por defecto S/ 1 230 (D.S. 015-2026-TR,
+  /// desde el 01/10/2026). Editable por empresa; null = sin referencia monetaria.
+  minimumWage              Decimal? @default(1230) @db.Decimal(10, 2)
+  /// Divisor para obtener el valor hora de una remuneracion mensual (30 x 8).
+  hourlyDivisor            Int      @default(240)
+  /// Moneda de los importes de referencia del reporte (ISO 4217).
+  payrollCurrency          String   @default("PEN") @db.VarChar(3)
+
   // --- Plan ---
   /// Duplicado de Subscription.tier para evitar un JOIN en cada request.
   /// Subscription es la fuente de verdad; los webhooks de billing sincronizan ambos.

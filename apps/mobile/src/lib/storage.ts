@@ -38,8 +38,21 @@ export async function getTokens(): Promise<StoredTokens | null> {
   return { accessToken, refreshToken };
 }
 
+const CACHED_USER = "scire.user";
+
+/** Perfil de la sesion, para poder abrir la app y marcar sin conexion. */
+export async function saveCachedUser(user: unknown): Promise<void> {
+  await SecureStore.setItemAsync(CACHED_USER, JSON.stringify(user));
+}
+
+export async function getCachedUser<T>(): Promise<T | null> {
+  const raw = await SecureStore.getItemAsync(CACHED_USER);
+  return raw ? (JSON.parse(raw) as T) : null;
+}
+
 export async function clearTokens(): Promise<void> {
   await Promise.all([
+    SecureStore.deleteItemAsync(CACHED_USER),
     SecureStore.deleteItemAsync(ACCESS_TOKEN),
     SecureStore.deleteItemAsync(REFRESH_TOKEN),
   ]);

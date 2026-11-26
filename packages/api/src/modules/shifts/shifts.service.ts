@@ -1,15 +1,23 @@
 import { db, Prisma, tenantData } from "@scire/database";
 import {
+  addDays,
   AppError,
+  breakMinutes,
+  buildSessions,
   durationSeconds,
   ErrorCode,
+  intervalMinutes,
   PunchType,
+  resolveOperationalDate,
+  scheduledMinutesFor,
   ShiftType,
   toZonedDateString,
   toZonedTimeString,
   VerificationStatus,
   WEEKDAY_LABELS_ES,
   weekDaysFrom,
+  workedIntervals,
+  zonedLocalToUtc,
   type BulkAssignShiftsInput,
   type DaySchedule,
   type ShiftBlock,
@@ -17,6 +25,11 @@ import {
   type UpdateShiftInput,
   type WeeklySchedule,
 } from "@scire/shared";
+import {
+  findShiftSlots,
+  getPunchState,
+  loadLaborRules,
+} from "../../services/workday.service.js";
 
 /**
  * Turnos y calendario.
@@ -43,36 +56,6 @@ function toBlock(shift: {
     endTime: shift.endTime,
     durationMinutes: Math.round(durationSeconds(shift.startTime, shift.endTime) / 60),
   };
-}
-
-/**
- * Minutos realmente trabajados a partir de las marcaciones del dia.
- *
- * Se calcula emparejando IN->OUT y descontando el tramo LUNCH_START->LUNCH_END.
- * Si falta la salida (el empleado aun esta dentro, o se olvido de marcar) el
- * dia cuenta 0: inventar una hora de salida seria fabricar datos de nomina.
- */
-function computeWorkedMinutes(
-  punches: { punchType: string; at: Date }[],
-): { workedMinutes: number; lunchMinutes: number; complete: boolean } {
-  const first = (type: string) => punches.find((p) => p.punchType === type)?.at;
-
-  const inAt = first(PunchType.IN);
-  const outAt = first(PunchType.OUT);
-  const lunchStart = first(PunchType.LUNCH_START);
-  const lunchEnd = first(PunchType.LUNCH_END);
-
-  const lunchMinutes =
-    lunchStart && lunchEnd
-      ? Math.max(0, Math.round((lunchEnd.getTime() - lunchStart.getTime()) / 60_000))
-      : 0;
-
-  if (!inAt || !outAt) {
-    return { workedMinutes: 0, lunchMinutes, complete: false };
-  }
-
-  const grossMinutes = Math.max(0, Math.round((outAt.getTime() - inAt.getTime()) / 60_000));
-  return { workedMinutes: Math.max(0, grossMinutes - lunchMinutes), lunchMinutes, complete: true };
 }
 
 function resolveStatus(input: {
@@ -102,21 +85,23 @@ export async function getWeeklySchedule(
   const weekEnd = days[6]!;
   const today = toZonedDateString(new Date(), timezone);
 
-  // Ventana UTC ampliada un dia a cada lado: el offset de la zona horaria
-  // puede desplazar una marcacion al dia UTC contiguo.
-  const from = new Date(`${weekStart}T00:00:00.000Z`);
-  const to = new Date(`${weekEnd}T23:59:59.999Z`);
-  const punchFrom = new Date(from.getTime() - 86_400_000);
-  const punchTo = new Date(to.getTime() + 86_400_000);
+  const rules = await loadLaborRules();
+  const from = dateOnly(weekStart);
+  const to = dateOnly(weekEnd);
+  // Se leen marcaciones a ambos lados de la semana: la salida del turno noche
+  // del sabado ocurre en la semana siguiente.
+  const punchFrom = zonedLocalToUtc(addDays(weekStart, -2), "00:00:00", timezone);
+  const punchTo = zonedLocalToUtc(addDays(weekEnd, 3), "00:00:00", timezone);
 
-  const [shifts, punches, absences] = await Promise.all([
+  const [shifts, slots, punches, absences] = await Promise.all([
     db.shift.findMany({
       where: { userId, date: { gte: from, lte: to } },
       select: { id: true, date: true, type: true, startTime: true, endTime: true },
       orderBy: { startTime: "asc" },
     }),
+    findShiftSlots(userId, addDays(weekStart, -3), addDays(weekEnd, 3)),
     db.attendanceRecord.findMany({
-      where: { userId, isVoided: false, serverTimestamp: { gte: punchFrom, lte: punchTo } },
+      where: { userId, isVoided: false, serverTimestamp: { gte: punchFrom, lt: punchTo } },
       select: {
         id: true,
         punchType: true,
@@ -132,6 +117,8 @@ export async function getWeeklySchedule(
       where: {
         userId,
         status: "APPROVED",
+        // Ni las horas extra ni una tardanza o falta injustificada justifican el dia.
+        type: { notIn: ["OVERTIME_REQUEST", "JUSTIFIED_TARDINESS", "UNJUSTIFIED_ABSENCE"] },
         startDate: { lte: to },
         endDate: { gte: from },
       },
@@ -145,10 +132,22 @@ export async function getWeeklySchedule(
     (shiftsByDay.get(key) ?? shiftsByDay.set(key, []).get(key)!).push(shift);
   }
 
-  const punchesByDay = new Map<string, typeof punches>();
-  for (const punch of punches) {
-    const key = toZonedDateString(punch.serverTimestamp, timezone);
-    (punchesByDay.get(key) ?? punchesByDay.set(key, []).get(key)!).push(punch);
+  // Las marcaciones se agrupan por jornada (fecha operativa), no por la fecha
+  // de calendario en que ocurrieron.
+  const workSlots = slots.filter((s) => s.type === ShiftType.WORK);
+  const now = new Date();
+  const sessions = buildSessions(
+    punches.map((p) => ({ ...p, at: p.serverTimestamp })),
+    {
+      maxShiftHours: rules.maxShiftHours,
+      now,
+      operationalDateFor: (at) => resolveOperationalDate(at, timezone, workSlots).date,
+    },
+  );
+  const sessionsByDay = new Map<string, typeof sessions>();
+  for (const session of sessions) {
+    const key = session.operationalDate;
+    (sessionsByDay.get(key) ?? sessionsByDay.set(key, []).get(key)!).push(session);
   }
 
   const totals = {
@@ -161,15 +160,18 @@ export async function getWeeklySchedule(
 
   const schedule: DaySchedule[] = days.map((day, index) => {
     const dayShifts = shiftsByDay.get(day) ?? [];
-    const dayPunches = punchesByDay.get(day) ?? [];
+    const daySessions = sessionsByDay.get(day) ?? [];
+    const dayPunches = daySessions.flatMap((session) => session.punches);
 
     const work = dayShifts.find((s) => s.type === ShiftType.WORK);
     const lunch = dayShifts.find((s) => s.type === ShiftType.LUNCH);
     const extra = dayShifts.filter((s) => s !== work && s !== lunch);
 
-    const worked = computeWorkedMinutes(
-      dayPunches.map((p) => ({ punchType: p.punchType, at: p.serverTimestamp })),
-    );
+    const worked = {
+      workedMinutes: daySessions.reduce((sum, s) => sum + intervalMinutes(workedIntervals(s)), 0),
+      lunchMinutes: daySessions.reduce((sum, s) => sum + breakMinutes(s), 0),
+      complete: daySessions.some((s) => s.status === "CLOSED"),
+    };
     const tardiness = dayPunches.reduce((sum, p) => sum + p.tardinessMinutes, 0);
 
     const hasApprovedAbsence = absences.some(
@@ -181,16 +183,19 @@ export async function getWeeklySchedule(
     const workBlock = work ? toBlock(work) : null;
     // El refrigerio no es tiempo trabajado: lo programado es el turno de
     // trabajo MENOS el almuerzo, que es exactamente lo que se paga.
-    const scheduledMinutes = workBlock
-      ? workBlock.durationMinutes - (lunch ? toBlock(lunch).durationMinutes : 0)
-      : 0;
+    const scheduledMinutes = scheduledMinutesFor(
+      day,
+      dayShifts.map((s) => ({ ...s, date: day })),
+      timezone,
+    );
 
     totals.scheduledMinutes += scheduledMinutes;
     totals.workedMinutes += worked.workedMinutes;
     totals.lunchMinutes += worked.lunchMinutes;
     totals.tardinessMinutes += tardiness;
-    if (worked.complete && scheduledMinutes > 0) {
-      totals.overtimeMinutes += Math.max(0, worked.workedMinutes - scheduledMinutes);
+    if (worked.complete) {
+      const limit = work ? scheduledMinutes : rules.dailyOrdinaryMinutes;
+      totals.overtimeMinutes += Math.max(0, worked.workedMinutes - limit);
     }
 
     return {
@@ -222,7 +227,16 @@ export async function getWeeklySchedule(
     };
   });
 
-  return { userId, weekStart, weekEnd, days: schedule, totals };
+  // Jornada vigente: puede haber empezado ayer (o en la semana anterior), asi
+  // que la app no puede deducirla mirando solo el dia de hoy.
+  const state = await getPunchState(userId, now, timezone, rules);
+  const currentJornada = {
+    date: state.operationalDate,
+    isOpen: state.openSession !== null,
+    allowedPunches: [...state.allowed],
+  };
+
+  return { userId, weekStart, weekEnd, days: schedule, totals, currentJornada };
 }
 
 export async function createShift(input: ShiftInput, createdById: string) {

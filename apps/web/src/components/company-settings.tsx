@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { ApiError, api } from "../lib/api";
 import { BiometricDevices } from "./biometric-devices";
 import { useBranch } from "./branch-context";
+import { LaborRulesSettings } from "./labor-rules";
 import {
   Badge,
   Button,
@@ -345,6 +346,8 @@ export function CompanySettings() {
           )}
         </CardContent>
       </Card>
+
+      <LaborRulesSettings />
 
       <BiometricDevices />
 

@@ -6,6 +6,7 @@ import {
   dateStringSchema,
   Feature,
   idSchema,
+  manualPunchSchema,
   paginationSchema,
   presignedUrlRequestSchema,
   UserRole,
@@ -69,6 +70,16 @@ punchRouter.post(
   asyncHandler(async (req, res) => {
     const input = parseBody(batchPunchSchema, req.body);
     ok(res, await punchService.createPunchBatch(req.auth!.sub, input));
+  }),
+);
+
+/** Regularizacion de RRHH: registra una marcacion que falta, con motivo. */
+punchRouter.post(
+  "/manual",
+  requireRole(UserRole.HR_ADMIN),
+  asyncHandler(async (req, res) => {
+    const input = parseBody(manualPunchSchema, req.body);
+    ok(res, await punchService.createManualPunch(input, req.auth!.sub), 201);
   }),
 );
 

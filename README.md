@@ -39,7 +39,7 @@ scire360-chronos/
 
 `packages/shared` no depende de Prisma: la app móvil la consume tal cual.
 
-La API viva está documentada en [`docs/api.md`](docs/api.md), la app móvil en [`docs/mobile.md`](docs/mobile.md) el panel de RRHH en [`docs/dashboard.md`](docs/dashboard.md) la facturación en [`docs/billing.md`](docs/billing.md) la seguridad avanzada en [`docs/security.md`](docs/security.md) y el design system en [`docs/design-system.md`](docs/design-system.md).
+La API viva está documentada en [`docs/api.md`](docs/api.md), la app móvil en [`docs/mobile.md`](docs/mobile.md) el panel de RRHH en [`docs/dashboard.md`](docs/dashboard.md) la facturación en [`docs/billing.md`](docs/billing.md) la seguridad avanzada en [`docs/security.md`](docs/security.md) el design system en [`docs/design-system.md`](docs/design-system.md), las reglas de jornadas y horas en [`docs/jornadas-y-horas.md`](docs/jornadas-y-horas.md) y el despliegue en [`docs/despliegue.md`](docs/despliegue.md).
 
 ---
 

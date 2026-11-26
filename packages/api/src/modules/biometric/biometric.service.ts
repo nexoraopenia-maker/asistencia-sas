@@ -2,16 +2,16 @@ import { randomBytes } from "node:crypto";
 import { db, Prisma, requireTenantContext, tenantData } from "@scire/database";
 import {
   AppError,
+  DEBOUNCED_READ_NOTE,
   DEVICE_STATE_TO_PUNCH,
   ErrorCode,
   parseLocalTimestamp,
   PunchSource,
   PunchType,
-  tardinessMinutes,
-  toZonedDateString,
+  lunchWindow,
+  ShiftType,
   toZonedTimeString,
   UserStatus,
-  VALID_PUNCH_TRANSITIONS,
   VerificationStatus,
   zonedLocalToUtc,
   type BiometricImportInput,
@@ -19,11 +19,17 @@ import {
   type BiometricImportResponse,
   type BiometricPunchInput,
   type CreateBiometricDeviceInput,
+  type LaborRules,
 } from "@scire/shared";
 import { loadConfig } from "../../config.js";
 import { hashToken } from "../../lib/jwt.js";
 import { emitEvent, WebhookEvent } from "../../services/webhooks.service.js";
-import { findShift } from "../punch/punch.service.js";
+import {
+  getPunchState,
+  loadLaborRules,
+  type CurrentPunchState,
+} from "../../services/workday.service.js";
+import { matchShift } from "../punch/punch.service.js";
 
 /**
  * Ingesta de marcaciones de relojes biometricos.
@@ -46,6 +52,8 @@ import { findShift } from "../punch/punch.service.js";
  * `(companyId, clientPunchId)` arbitra. Una marcacion ANULADA por RRHH tampoco
  * resucita al reimportar el log, porque su clave sigue ocupada.
  */
+
+const MAX_NOTES_LENGTH = 500;
 
 /** Margen para relojes ligeramente adelantados respecto al servidor. */
 const FUTURE_TOLERANCE_MS = 5 * 60_000;
@@ -108,45 +116,20 @@ function resolveInstant(raw: string, timezone: string): Date {
   return new Date(Math.floor(instant.getTime() / 1000) * 1000);
 }
 
-/** Ultima marcacion vigente del MISMO dia local anterior a `instant`. */
-async function previousPunchOfDay(
-  userId: string,
-  instant: Date,
-  localDate: string,
-  timezone: string,
-): Promise<PunchType | "NONE"> {
-  // Ventana amplia y filtro por fecha local: el offset de la zona puede mover
-  // la jornada a ambos lados del dia UTC.
-  const candidates = await db.attendanceRecord.findMany({
-    where: {
-      userId,
-      isVoided: false,
-      serverTimestamp: { gte: new Date(instant.getTime() - 36 * 3_600_000), lt: instant },
-    },
-    select: { punchType: true, serverTimestamp: true },
-    orderBy: { serverTimestamp: "desc" },
-  });
-  const last = candidates.find(
-    (record) => toZonedDateString(record.serverTimestamp, timezone) === localDate,
-  );
-  return (last?.punchType as PunchType | undefined) ?? "NONE";
-}
-
 /**
  * Decide el tipo de marcacion.
  *
  * La unica ambiguedad real de la secuencia es despues de una entrada: puede
  * ser el inicio del refrigerio o la salida. Se resuelve con el turno de
- * refrigerio del dia: si se marca antes de que termine, es LUNCH_START. Sin
- * turno de refrigerio asignado, es la salida.
+ * refrigerio de la jornada: si se marca antes de que termine, es LUNCH_START.
+ * Sin turno de refrigerio asignado, es la salida. En un turno nocturno el
+ * refrigerio de las 00:30 pertenece a la jornada que empezo la tarde anterior.
  */
-async function resolvePunchType(
+function resolvePunchType(
   punch: ResolvedPunch,
-  previous: PunchType | "NONE",
-  localDate: string,
-  localTime: string,
-): Promise<{ punchType: PunchType; hintIgnored: PunchType | null }> {
-  const allowed = VALID_PUNCH_TRANSITIONS[previous];
+  state: CurrentPunchState,
+): { punchType: PunchType; hintIgnored: PunchType | null } {
+  const { allowed, previous } = state;
   const hint =
     punch.input.punchType ??
     (punch.input.deviceState !== undefined ? DEVICE_STATE_TO_PUNCH[punch.input.deviceState] : undefined);
@@ -165,8 +148,13 @@ async function resolvePunchType(
   if (allowed.length === 1) {
     inferred = allowed[0]!;
   } else {
-    const lunch = await findShift(punch.user.id, localDate, "LUNCH");
-    inferred = lunch && localTime < lunch.endTime ? PunchType.LUNCH_START : PunchType.OUT;
+    const shifts = state.shifts.filter((s) => s.date === state.operationalDate);
+    const lunch = shifts.find((s) => s.type === ShiftType.LUNCH);
+    const work = shifts.find((s) => s.type === ShiftType.WORK) ?? null;
+    const beforeLunchEnds =
+      lunch !== undefined &&
+      punch.instant < lunchWindow(state.operationalDate, lunch, work, punch.timezone).end;
+    inferred = beforeLunchEnds ? PunchType.LUNCH_START : PunchType.OUT;
   }
   return { punchType: inferred, hintIgnored: hint ?? null };
 }
@@ -175,15 +163,15 @@ async function resolvePunchType(
 async function findExisting(clientPunchId: string, userId: string, instant: Date) {
   const exact = await db.attendanceRecord.findFirst({
     where: { clientPunchId },
-    select: { id: true, punchType: true, serverTimestamp: true },
+    select: { id: true, punchType: true, serverTimestamp: true, notes: true },
   });
-  if (exact) return exact;
+  if (exact) return { ...exact, debounced: false };
 
   // Doble lectura: el mismo empleado en una ventana corta. Cubre tambien que la
   // misma persona marcara en el movil y en el reloj a la vez.
   const debounceMs = loadConfig().BIOMETRIC_DEBOUNCE_SECONDS * 1000;
   if (debounceMs === 0) return null;
-  return db.attendanceRecord.findFirst({
+  const near = await db.attendanceRecord.findFirst({
     where: {
       userId,
       isVoided: false,
@@ -192,14 +180,35 @@ async function findExisting(clientPunchId: string, userId: string, instant: Date
         lte: new Date(instant.getTime() + debounceMs),
       },
     },
-    select: { id: true, punchType: true, serverTimestamp: true },
+    select: { id: true, punchType: true, serverTimestamp: true, notes: true },
+  });
+  return near ? { ...near, debounced: true } : null;
+}
+
+/**
+ * Deja rastro en la marcacion conservada de la lectura descartada por doble
+ * lectura, para que RRHH pueda auditarla. Es idempotente: reenviar el lote no
+ * vuelve a escribirla.
+ */
+async function traceDebouncedRead(
+  record: { id: string; serverTimestamp: Date; notes: string | null },
+  instant: Date,
+  timezone: string,
+): Promise<void> {
+  if (record.serverTimestamp.getTime() === instant.getTime()) return;
+  const mark = `${DEBOUNCED_READ_NOTE} ${toZonedTimeString(instant, timezone)}`;
+  const notes = record.notes ?? "";
+  if (notes.includes(mark) || notes.length > MAX_NOTES_LENGTH) return;
+  await db.attendanceRecord.update({
+    where: { id: record.id },
+    data: { notes: [notes, mark].filter(Boolean).join(" · ") },
   });
 }
 
 async function ingestOne(
   punch: ResolvedPunch,
   source: BiometricSource,
-  lateToleranceMinutes: number,
+  rules: LaborRules,
 ): Promise<BiometricImportItemResult> {
   const base = {
     index: punch.index,
@@ -210,6 +219,7 @@ async function ingestOne(
 
   const existing = await findExisting(clientPunchId, punch.user.id, punch.instant);
   if (existing) {
+    if (existing.debounced) await traceDebouncedRead(existing, punch.instant, punch.timezone);
     return {
       ...base,
       status: "duplicate",
@@ -219,23 +229,21 @@ async function ingestOne(
     };
   }
 
-  const localDate = toZonedDateString(punch.instant, punch.timezone);
-  const localTime = toZonedTimeString(punch.instant, punch.timezone);
-  const previous = await previousPunchOfDay(punch.user.id, punch.instant, localDate, punch.timezone);
-  const { punchType, hintIgnored } = await resolvePunchType(punch, previous, localDate, localTime);
-
-  const isLunch = punchType === PunchType.LUNCH_START || punchType === PunchType.LUNCH_END;
-  const shift = await findShift(punch.user.id, localDate, isLunch ? "LUNCH" : "WORK");
-  const tardiness =
-    shift && punchType === PunchType.IN
-      ? tardinessMinutes(shift.startTime, localTime, lateToleranceMinutes)
-      : 0;
+  const state = await getPunchState(punch.user.id, punch.instant, punch.timezone, rules);
+  const { punchType, hintIgnored } = resolvePunchType(punch, state);
+  const { shiftId, tardiness } = matchShift(
+    state,
+    punchType,
+    punch.instant,
+    punch.timezone,
+    rules.lateToleranceMinutes,
+  );
 
   const notes = [
     `Reloj biometrico${source.deviceName ? ` "${source.deviceName}"` : " (importacion manual)"}`,
     punch.input.verifyMode ? VERIFY_MODE_LABELS[punch.input.verifyMode] : null,
     punch.input.deviceLogId ? `log ${punch.input.deviceLogId}` : null,
-    hintIgnored ? `el reloj indico ${hintIgnored}, no encajaba tras ${previous}` : null,
+    hintIgnored ? `el reloj indico ${hintIgnored}, no encajaba tras ${state.previous}` : null,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -246,7 +254,7 @@ async function ingestOne(
       data: tenantData<Prisma.AttendanceRecordUncheckedCreateInput>({
         userId: punch.user.id,
         branchId: punch.branch.id,
-        shiftId: shift?.id ?? null,
+        shiftId,
         punchType,
         source: PunchSource.BIOMETRIC,
         serverTimestamp: punch.instant,
@@ -304,7 +312,7 @@ export async function importBiometricPunches(
   input: BiometricImportInput,
   source: BiometricSource,
 ): Promise<BiometricImportResponse> {
-  const { companyId } = requireTenantContext();
+  requireTenantContext();
   const config = loadConfig();
   const now = Date.now();
 
@@ -314,10 +322,7 @@ export async function importBiometricPunches(
   const codes = [...new Set(input.punches.map((p) => p.employeeCode))];
 
   const [company, users, branches] = await Promise.all([
-    db.company.findUniqueOrThrow({
-      where: { id: companyId },
-      select: { timezone: true, lateToleranceMinutes: true },
-    }),
+    loadLaborRules(),
     db.user.findMany({
       where: { employeeCode: { in: codes } },
       select: { id: true, employeeCode: true, status: true },
@@ -392,7 +397,7 @@ export async function importBiometricPunches(
 
   for (const punch of resolved) {
     try {
-      results.push(await ingestOne(punch, source, company.lateToleranceMinutes));
+      results.push(await ingestOne(punch, source, company));
     } catch (error) {
       const appError =
         error instanceof AppError

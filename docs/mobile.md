@@ -16,7 +16,7 @@ apps/mobile/
 └── src/
     ├── api/       client (refresco single-flight) · endpoints · upload
     ├── auth/      AuthContext: sesión, biometría, cierre
-    ├── offline/   queue (SQLite) · sync (lotes) · OfflineContext
+    ├── offline/   queue (SQLite) · syncCore · sync · OfflineContext
     ├── hooks/     useGeolocation · usePunch · useWeeklySchedule
     ├── components/EmployeeHeader · CalendarStrip · ShiftDetailModal · SelfieCapture · PunchSheet · SyncIndicator
     └── lib/       theme · storage · errors · punchFlow
@@ -71,19 +71,57 @@ Detalles que importan:
 
 ---
 
-## Motor offline-first
+## Modo sin conexión
 
-Cola en **SQLite** (`src/offline/queue.ts`), no AsyncStorage: una marcación perdida es una hora de trabajo que el empleado no cobra. SQLite da escrituras atómicas y una clave primaria que impide duplicar; AsyncStorage obligaría a leer‑modificar‑escribir un JSON entero, con una ventana de corrupción en cada guardado.
+Cola en **SQLite** (`src/offline/queue.ts`). La lógica de envío está en `syncCore.ts` (sin dependencias nativas, con pruebas); `sync.ts` la conecta con el dispositivo.
 
-**Qué se encola y qué no.** Solo un `NetworkError` manda una marcación a la cola. Un 422 por geocerca también "falla", pero encolarlo únicamente aplazaría el mismo rechazo: sube a la pantalla con un mensaje accionable (*"estás a 340 m de tu sucursal"*).
+| Situación | Comportamiento |
+|---|---|
+| Marcar sin red | Se guarda con su hora real y la selfie se copia a documentos (la caché puede borrarse) |
+| Corte a mitad de envío, 5xx o 429 | Se encola con **el mismo `clientPunchId` y la misma hora**; si ya había llegado, vuelve como duplicado |
+| Rechazo definitivo (p. ej. geocerca) | Sale de la cola y queda visible en *Más* |
+| Fallo transitorio al sincronizar | Nada se borra; se respeta el orden |
+| Cierre de sesión o sesión caducada | La cola se conserva, ligada a su dueño |
+| Abrir la app sin red | Usa el perfil y el calendario guardados (hay que haber iniciado sesión antes) |
 
-**Corte a mitad de envío.** Si la red cae después de enviar pero antes de recibir la respuesta, la marcación se encola **con el mismo `clientPunchId`**. Si el servidor sí la recibió, la sincronización la verá como duplicado y no creará una segunda.
+La sincronización se dispara al iniciar sesión, al volver a primer plano, al recuperar red y cada 60 s mientras queden pendientes. La pantalla muestra *pendiente*, *sincronizando* y *sincronizadas*.
 
-**Selfies pendientes.** Una marcación tomada sin cobertura no pudo pedir su URL firmada: la foto queda en disco y se sube justo antes de enviar el lote. Si la subida falla por algo que no es la red, la marcación se envía igualmente sin foto — que decida el servidor según la política de la empresa, en vez de descartar en silencio un fichaje real.
+Límites:
 
-**Sincronización.** Se dispara en la *transición* de sin red a con red, no en cada evento de NetInfo (que emite con frecuencia: cambio de wifi a datos, variación de intensidad). Un solo lote en vuelo a la vez.
+- El lote offline requiere un plan que lo incluya; si no, las marcaciones quedan en cola y se muestra el motivo.
+- El servidor rechaza marcaciones con más de `MAX_OFFLINE_AGE_HOURS` (72 h). RRHH puede regularizarlas.
+- Los rechazos solo se ven en el teléfono; RRHH no recibe aviso.
+- La hora offline es la del teléfono. El servidor conserva la hora de recepción para auditarla.
+- Desinstalar la app borra la cola.
 
-**Rechazos visibles.** Una marcación que el servidor rechaza sale de la cola y pasa a una tabla aparte que la pestaña *Más* muestra. Desaparecer en silencio sería lo peor que podría hacer la app con un fichaje.
+---
+
+## Distribución (APK / tiendas)
+
+La compilación se hace con **EAS Build** (servicio de Expo, requiere una cuenta). La configuración está en `apps/mobile/eas.json`. El hook `eas-build-post-install` compila `@scire/shared` en el servidor de Expo.
+
+```bash
+cd apps/mobile
+npx eas-cli@latest login
+npx eas-cli@latest init          # una vez: vincula el proyecto (añade projectId a app.json)
+
+# URL pública HTTPS de la API: obligatoria, no uses localhost
+npx eas-cli@latest env:create --environment preview \
+  --name EXPO_PUBLIC_API_URL --value https://api.tu-dominio.com --visibility plaintext
+
+npx eas-cli@latest build --platform android --profile preview      # APK instalable
+npx eas-cli@latest build --platform android --profile production   # AAB para Google Play
+```
+
+Para producción, repite `env:create` con `--environment production`. Para iOS se necesita una cuenta de Apple Developer (`--platform ios`) y distribuir por TestFlight.
+
+### Publicar el enlace de descarga
+
+1. Descarga el APK desde el enlace que entrega EAS (los enlaces internos caducan).
+2. Súbelo a un alojamiento HTTPS estable (por ejemplo, un *Release* de GitHub).
+3. Define `MOBILE_APK_URL` en las variables del proyecto web y vuelve a desplegar.
+
+Empleados y administradores lo descargan desde `/descargar`.
 
 ---
 
@@ -107,6 +145,6 @@ El estado de asistencia se comunica con **color + etiqueta**, nunca solo con col
 
 ## Tests
 
-`pnpm --filter @scire/mobile test` cubre la lógica pura (`src/lib/punchFlow.ts`): la máquina de estados de la jornada y la traducción de errores a mensajes accionables.
+`pnpm --filter @scire/mobile test` cubre la lógica pura: la máquina de estados de la jornada y los errores (`src/lib/punchFlow.ts`) y la sincronización de la cola (`src/offline/syncCore.ts`).
 
 Los hooks y componentes importan `expo-camera`, `expo-haptics` y `expo-location` en el nivel de módulo y no se pueden cargar fuera de un dispositivo. Probarlos aquí exigiría una capa de mocks que verificaría los mocks, no la app; su cobertura real es el bundle de `expo export` y la prueba en dispositivo.

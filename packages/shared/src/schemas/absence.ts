@@ -34,6 +34,8 @@ export const reviewAbsenceSchema = z.object({
   id: idSchema,
   status: z.enum([AbsenceStatus.APPROVED, AbsenceStatus.REJECTED]),
   reviewNotes: z.string().trim().max(500).optional(),
+  /** Solo horas extra: minutos aprobados. Por defecto, los solicitados. */
+  approvedMinutes: z.number().int().min(1).max(1440).optional(),
 });
 export type ReviewAbsenceInput = z.infer<typeof reviewAbsenceSchema>;
 

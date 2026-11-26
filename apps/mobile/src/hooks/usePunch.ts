@@ -2,11 +2,11 @@ import { PunchSource, type CreatePunchInput, type PunchResult, type PunchType } 
 import * as Crypto from "expo-crypto";
 import * as Haptics from "expo-haptics";
 import { useCallback, useState } from "react";
-import { NetworkError } from "../api/client";
 import { punchApi } from "../api/endpoints";
 import { uploadSelfie } from "../api/upload";
 import { useOffline } from "../offline/OfflineContext";
-import { useGeolocation, type PunchLocation } from "./useGeolocation";
+import { isTransient } from "../offline/syncCore";
+import { useGeolocation } from "./useGeolocation";
 
 export { punchErrorMessage } from "../lib/punchFlow";
 
@@ -32,69 +32,68 @@ interface SubmitInput {
 
 export function usePunch() {
   const { getLocation, isLocating } = useGeolocation();
-  const { isOnline, queuePunch } = useOffline();
+  const { isOnline, pendingCount, queuePunch, sync } = useOffline();
   const [isSubmitting, setIsSubmitting] = useState(false);
-
-  const buildPayload = useCallback(
-    (
-      input: SubmitInput,
-      location: PunchLocation,
-      selfieObjectKey: string | undefined,
-      source: PunchSource,
-    ): CreatePunchInput => ({
-      punchType: input.punchType,
-      branchId: input.branchId,
-      location,
-      deviceTimestamp: new Date().toISOString(),
-      clientPunchId: Crypto.randomUUID(),
-      source,
-      ...(selfieObjectKey ? { selfieObjectKey } : {}),
-    }),
-    [],
-  );
 
   const submit = useCallback(
     async (input: SubmitInput): Promise<PunchOutcome> => {
       setIsSubmitting(true);
       try {
+        // Id y hora se fijan UNA vez, en el momento de marcar: todos los
+        // reintentos reutilizan los mismos, asi que no se puede duplicar ni
+        // desplazar la hora real.
+        const clientPunchId = Crypto.randomUUID();
+        const deviceTimestamp = new Date().toISOString();
         const location = await getLocation();
+        const base = {
+          punchType: input.punchType,
+          branchId: input.branchId,
+          location,
+          deviceTimestamp,
+          clientPunchId,
+        };
 
-        // Sin cobertura ni se intenta: se encola con la foto en disco, que se
-        // subira al bucket durante la sincronizacion.
-        if (!isOnline) {
-          const payload = buildPayload(input, location, undefined, PunchSource.MOBILE_OFFLINE);
-          await queuePunch(payload, input.photoUri);
+        const queue = async (
+          reason: "offline" | "network",
+          selfieObjectKey?: string,
+        ): Promise<PunchOutcome> => {
+          await queuePunch(
+            {
+              ...base,
+              source: PunchSource.MOBILE_OFFLINE,
+              ...(selfieObjectKey ? { selfieObjectKey } : {}),
+            },
+            // La foto en disco se subira al sincronizar si aun no se subio.
+            selfieObjectKey ? null : input.photoUri,
+          );
           await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-          return { kind: "queued", reason: "offline" };
-        }
+          return { kind: "queued", reason };
+        };
 
+        // Sin cobertura ni se intenta.
+        if (!isOnline) return await queue("offline");
+        // Lo pendiente va primero, o el servidor veria la secuencia al reves.
+        if (pendingCount > 0) await sync();
+
+        let selfieObjectKey: string | undefined;
         try {
-          const selfieObjectKey = input.photoUri
+          selfieObjectKey = input.photoUri
             ? await uploadSelfie(input.photoUri, input.punchType)
             : undefined;
-
-          const payload = buildPayload(input, location, selfieObjectKey, PunchSource.MOBILE);
-          const result = await punchApi.create(payload);
-
+          const result = await punchApi.create({
+            ...base,
+            source: PunchSource.MOBILE,
+            ...(selfieObjectKey ? { selfieObjectKey } : {}),
+          });
           // Vibracion de exito: la confirmacion fisica importa cuando se ficha
-          // con guantes, con el movil a media luz o sin mirar la pantalla.
+          // con guantes o sin mirar la pantalla.
           await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
           return { kind: "submitted", result };
         } catch (error) {
-          if (error instanceof NetworkError) {
-            // Se cayo la red a mitad del envio. Puede que el servidor la haya
-            // recibido igualmente: se encola con el MISMO clientPunchId, asi
-            // que si llego, la sincronizacion la vera como duplicado y no
-            // creara una segunda marcacion.
-            const payload = buildPayload(input, location, undefined, PunchSource.MOBILE_OFFLINE);
-            await queuePunch(payload, input.photoUri);
-            await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-            return { kind: "queued", reason: "network" };
-          }
-
-          // Rechazo del servidor (fuera de geocerca, secuencia invalida, GPS
-          // falso): reintentarlo daria lo mismo. Sube tal cual a la pantalla,
-          // que ya sabe traducir `error.code` a un mensaje util.
+          // Red caida o servidor temporalmente indisponible. Puede que la haya
+          // recibido: con el mismo clientPunchId se resolvera como duplicado.
+          if (isTransient(error)) return await queue("network", selfieObjectKey);
+          // Rechazo definitivo: reintentarlo daria lo mismo.
           await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
           throw error;
         }
@@ -102,7 +101,7 @@ export function usePunch() {
         setIsSubmitting(false);
       }
     },
-    [buildPayload, getLocation, isOnline, queuePunch],
+    [getLocation, isOnline, pendingCount, queuePunch, sync],
   );
 
   return { submit, isSubmitting, isLocating, isBusy: isSubmitting || isLocating };

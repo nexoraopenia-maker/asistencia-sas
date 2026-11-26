@@ -1,4 +1,4 @@
-import { CloudOff, RefreshCw, TriangleAlert } from "lucide-react-native";
+import { CheckCircle2, CloudOff, RefreshCw, TriangleAlert } from "lucide-react-native";
 import { ActivityIndicator, Pressable, Text, View } from "react-native";
 import { useOffline } from "../offline/OfflineContext";
 import { colors } from "../lib/theme";
@@ -11,9 +11,22 @@ import { colors } from "../lib/theme";
  * que la gente deja de mirar justo cuando importa.
  */
 export function SyncIndicator() {
-  const { isOnline, pendingCount, isSyncing, rejections, sync } = useOffline();
+  const { isOnline, pendingCount, isSyncing, justSynced, blockedReason, rejections, sync } =
+    useOffline();
 
-  if (isOnline && pendingCount === 0 && rejections.length === 0) return null;
+  if (isOnline && pendingCount === 0 && rejections.length === 0) {
+    if (justSynced === 0) return null;
+    return (
+      <View className="flex-row items-center rounded-2xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-3">
+        <CheckCircle2 size={16} color={colors.emerald} />
+        <Text className="ml-2 flex-1 text-sm text-emerald-300">
+          {justSynced === 1
+            ? "1 marcacion sincronizada"
+            : `${justSynced} marcaciones sincronizadas`}
+        </Text>
+      </View>
+    );
+  }
 
   if (rejections.length > 0) {
     return (
@@ -49,7 +62,11 @@ export function SyncIndicator() {
         <CloudOff size={16} color={colors.amber} />
       )}
       <Text className="ml-2 flex-1 text-sm text-amber-300">
-        {isSyncing ? "Sincronizando marcaciones..." : label}
+        {isSyncing
+          ? "Sincronizando marcaciones..."
+          : isOnline && blockedReason
+            ? `${label}. ${blockedReason}`
+            : label}
       </Text>
       {isOnline && !isSyncing && pendingCount > 0 && (
         <Text className="text-xs font-semibold text-amber-400">Reintentar</Text>

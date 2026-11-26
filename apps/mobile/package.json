@@ -11,7 +11,8 @@
     "typecheck": "tsc --noEmit",
     "doctor": "expo-doctor",
     "clean": "rm -rf .expo dist .turbo",
-    "test": "vitest run"
+    "test": "vitest run",
+    "eas-build-post-install": "pnpm --filter @scire/shared build"
   },
   "dependencies": {
     "@expo-google-fonts/plus-jakarta-sans": "^0.4.2",

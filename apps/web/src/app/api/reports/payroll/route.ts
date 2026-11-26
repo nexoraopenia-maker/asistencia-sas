@@ -1,8 +1,9 @@
 import { NextResponse, type NextRequest } from "next/server";
-import ExcelJS from "exceljs";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import { apiFetch } from "../../../../lib/server-api";
 import { setSessionCookies } from "../../../../lib/session";
+import { buildExcel } from "../../../../lib/report-excel";
+import { hhmm, type AttendanceDetail, type PayrollRow } from "../../../../lib/report-types";
 
 /**
  * Exportacion de nomina en Excel y PDF.
@@ -16,108 +17,6 @@ import { setSessionCookies } from "../../../../lib/session";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-interface PayrollRow {
-  userId: string;
-  fullName: string;
-  employeeCode: string;
-  jobTitle: string | null;
-  branchName: string | null;
-  daysWorked: number;
-  daysAbsent: number;
-  regularMinutes: number;
-  lunchMinutes: number;
-  tardinessMinutes: number;
-  earlyLeaveMinutes: number;
-  overtimeMinutes: number;
-  scheduledMinutes: number;
-}
-
-/** `510` -> `8:30`. Las horas de nomina se leen en horas y minutos, no en decimales. */
-function hhmm(minutes: number): string {
-  const abs = Math.abs(Math.round(minutes));
-  return `${Math.floor(abs / 60)}:${String(abs % 60).padStart(2, "0")}`;
-}
-
-const COLUMNS = [
-  { header: "Codigo", key: "employeeCode", width: 14 },
-  { header: "Colaborador", key: "fullName", width: 28 },
-  { header: "Cargo", key: "jobTitle", width: 24 },
-  { header: "Sucursal", key: "branchName", width: 18 },
-  { header: "Dias trabajados", key: "daysWorked", width: 16 },
-  { header: "Dias ausente", key: "daysAbsent", width: 14 },
-  { header: "Horas regulares", key: "regular", width: 16 },
-  { header: "Refrigerio", key: "lunch", width: 12 },
-  { header: "Tardanza (min)", key: "tardiness", width: 15 },
-  { header: "Salida anticipada (min)", key: "earlyLeave", width: 22 },
-  { header: "Horas extra", key: "overtime", width: 13 },
-] as const;
-
-async function buildExcel(rows: PayrollRow[], range: { from: string; to: string }): Promise<Buffer> {
-  const workbook = new ExcelJS.Workbook();
-  workbook.creator = "Scire 360 Chronos";
-  workbook.created = new Date();
-
-  const sheet = workbook.addWorksheet("Nomina", {
-    views: [{ state: "frozen", ySplit: 3 }],
-  });
-
-  sheet.mergeCells("A1:K1");
-  const title = sheet.getCell("A1");
-  title.value = `Reporte de nomina · ${range.from} a ${range.to}`;
-  title.font = { size: 14, bold: true };
-  sheet.getRow(1).height = 24;
-
-  sheet.getRow(2).values = [];
-
-  const headerRow = sheet.getRow(3);
-  headerRow.values = COLUMNS.map((column) => column.header);
-  headerRow.font = { bold: true, color: { argb: "FFFFFFFF" } };
-  headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF312E81" } };
-  headerRow.alignment = { vertical: "middle" };
-  headerRow.height = 20;
-
-  COLUMNS.forEach((column, index) => {
-    sheet.getColumn(index + 1).width = column.width;
-  });
-
-  for (const row of rows) {
-    sheet.addRow([
-      row.employeeCode,
-      row.fullName,
-      row.jobTitle ?? "",
-      row.branchName ?? "",
-      row.daysWorked,
-      row.daysAbsent,
-      hhmm(row.regularMinutes),
-      hhmm(row.lunchMinutes),
-      row.tardinessMinutes,
-      row.earlyLeaveMinutes,
-      hhmm(row.overtimeMinutes),
-    ]);
-  }
-
-  // Fila de totales: es lo primero que busca quien revisa una nomina.
-  const totals = sheet.addRow([
-    "",
-    `TOTAL (${rows.length})`,
-    "",
-    "",
-    rows.reduce((sum, row) => sum + row.daysWorked, 0),
-    rows.reduce((sum, row) => sum + row.daysAbsent, 0),
-    hhmm(rows.reduce((sum, row) => sum + row.regularMinutes, 0)),
-    hhmm(rows.reduce((sum, row) => sum + row.lunchMinutes, 0)),
-    rows.reduce((sum, row) => sum + row.tardinessMinutes, 0),
-    rows.reduce((sum, row) => sum + row.earlyLeaveMinutes, 0),
-    hhmm(rows.reduce((sum, row) => sum + row.overtimeMinutes, 0)),
-  ]);
-  totals.font = { bold: true };
-  totals.border = { top: { style: "medium" } };
-
-  sheet.autoFilter = { from: { row: 3, column: 1 }, to: { row: 3, column: COLUMNS.length } };
-
-  return Buffer.from(await workbook.xlsx.writeBuffer());
-}
-
 async function buildPdf(rows: PayrollRow[], range: { from: string; to: string }): Promise<Buffer> {
   const pdf = await PDFDocument.create();
   const font = await pdf.embedFont(StandardFonts.Helvetica);
@@ -128,8 +27,8 @@ async function buildPdf(rows: PayrollRow[], range: { from: string; to: string })
   const MARGIN = 32;
   const ROW_HEIGHT = 18;
 
-  const headers = ["Codigo", "Colaborador", "Sucursal", "Dias", "Regulares", "Refrig.", "Tard.", "Salida ant.", "Extra"];
-  const widths = [70, 170, 100, 45, 70, 60, 50, 75, 60];
+  const headers = ["Codigo", "Colaborador", "Sucursal", "Dias", "Trabajadas", "Nocturnas", "Tard.", "Salida ant.", "Extra T1", "Extra T2", "Incid."];
+  const widths = [70, 160, 90, 35, 65, 65, 40, 60, 55, 55, 40];
 
   let page = pdf.addPage([PAGE.width, PAGE.height]);
   let y = PAGE.height - MARGIN;
@@ -183,10 +82,12 @@ async function buildPdf(rows: PayrollRow[], range: { from: string; to: string })
       row.branchName ?? "—",
       String(row.daysWorked),
       hhmm(row.regularMinutes),
-      hhmm(row.lunchMinutes),
+      hhmm(row.nightMinutes),
       String(row.tardinessMinutes),
       String(row.earlyLeaveMinutes),
-      hhmm(row.overtimeMinutes),
+      hhmm(row.overtimeTier1Minutes),
+      hhmm(row.overtimeTier2Minutes),
+      String(row.incidentCount),
     ];
 
     let x = MARGIN;
@@ -245,7 +146,18 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     });
   }
 
-  const excel = await buildExcel(rows, { from, to });
+  const detail = await apiFetch(`/api/v1/reports/detail?${query.toString()}`);
+  if (detail.rotatedTokens) await setSessionCookies(detail.rotatedTokens);
+  // 404 = API sin actualizar: se entrega al menos el resumen en vez de fallar.
+  if (detail.status !== 200 && detail.status !== 404) {
+    return NextResponse.json(detail.body ?? { success: false }, { status: detail.status });
+  }
+
+  const excel = await buildExcel(
+    rows,
+    { from, to },
+    detail.status === 200 ? (detail.body as { data: AttendanceDetail }).data : null,
+  );
   return new NextResponse(new Uint8Array(excel), {
     headers: {
       "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

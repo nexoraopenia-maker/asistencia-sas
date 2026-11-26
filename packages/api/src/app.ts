@@ -4,6 +4,7 @@ import express, { type Express } from "express";
 import helmet from "helmet";
 import { errorHandler } from "./lib/http.js";
 import { bindTenant, bindTenantIfAuthenticated, requireAuth } from "./middleware/auth.js";
+import { absencesRouter } from "./modules/absences/absences.routes.js";
 import { auditRouter } from "./modules/audit/audit.routes.js";
 import { authRouter } from "./modules/auth/auth.routes.js";
 import { billingRouter } from "./modules/billing/billing.routes.js";
@@ -62,6 +63,7 @@ export function createApp(): Express {
   app.use("/api/v1/punch", requireAuth, bindTenant, punchRouter);
   app.use("/api/v1/shifts", requireAuth, bindTenant, shiftsRouter);
   app.use("/api/v1/audit", requireAuth, bindTenant, auditRouter);
+  app.use("/api/v1/absences", requireAuth, bindTenant, absencesRouter);
   app.use("/api/v1/company", requireAuth, bindTenant, companyRouter);
   app.use("/api/v1/users", requireAuth, bindTenant, usersRouter);
   app.use("/api/v1/reports", requireAuth, bindTenant, reportsRouter);

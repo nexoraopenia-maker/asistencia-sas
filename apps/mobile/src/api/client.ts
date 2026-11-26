@@ -38,9 +38,9 @@ export function setSessionExpiredHandler(handler: SessionExpiredHandler): void {
  * tres caducan a la vez, tres refrescos con el mismo token se leerian como un
  * robo de credenciales y echarian al empleado de la aplicacion.
  */
-let refreshInFlight: Promise<StoredTokens | null> | null = null;
+let refreshInFlight: Promise<StoredTokens | "unreachable" | null> | null = null;
 
-async function refreshTokens(): Promise<StoredTokens | null> {
+async function refreshTokens(): Promise<StoredTokens | "unreachable" | null> {
   refreshInFlight ??= (async () => {
     try {
       const stored = await getTokens();
@@ -52,6 +52,8 @@ async function refreshTokens(): Promise<StoredTokens | null> {
         body: JSON.stringify({ refreshToken: stored.refreshToken }),
       });
 
+      // Un 500 o un 429 no invalidan la sesion: solo un rechazo explicito.
+      if (response.status >= 500 || response.status === 429) return "unreachable";
       if (!response.ok) {
         await clearTokens();
         onSessionExpired();
@@ -68,7 +70,7 @@ async function refreshTokens(): Promise<StoredTokens | null> {
     } catch {
       // Fallo de red durante el refresco: la sesion sigue siendo valida, solo
       // no hay cobertura. No se borran los tokens.
-      return null;
+      return "unreachable";
     } finally {
       // Se libera en el siguiente tick para que las peticiones que ya estaban
       // esperando reciban este mismo resultado.
@@ -120,6 +122,7 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
 
   if (response.status === 401 && !options.anonymous && stored) {
     const refreshed = await refreshTokens();
+    if (refreshed === "unreachable") throw new NetworkError();
     if (refreshed) {
       response = await rawRequest(path, options, refreshed.accessToken);
     }

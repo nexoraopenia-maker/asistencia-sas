@@ -6,6 +6,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { NetworkError } from "../../src/api/client";
 import { punchApi } from "../../src/api/endpoints";
 import { SyncIndicator } from "../../src/components/SyncIndicator";
+import { useOffline } from "../../src/offline/OfflineContext";
 import { BRAND_GRADIENT, colors } from "../../src/lib/theme";
 
 type HistoryItem = Awaited<ReturnType<typeof punchApi.history>>["items"][number];
@@ -57,6 +58,7 @@ function PunchRow({ item }: { item: HistoryItem }) {
         </Text>
         <Text className="mt-0.5 text-xs text-slate-500">
           {date} · {item.branch.name}
+          {item.source === "MOBILE_OFFLINE" ? " · Sincronizada sin conexion" : ""}
         </Text>
         {item.isMockLocation && (
           <Text className="mt-1 text-xs text-amber-400">Ubicacion simulada detectada</Text>
@@ -78,6 +80,7 @@ function PunchRow({ item }: { item: HistoryItem }) {
 
 export default function AsistenciaScreen() {
   const insets = useSafeAreaInsets();
+  const { pending } = useOffline();
   const [items, setItems] = useState<HistoryItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -99,9 +102,10 @@ export default function AsistenciaScreen() {
     }
   }, []);
 
+  // Se recarga al vaciarse la cola: las enviadas pasan al historial.
   useEffect(() => {
     void load();
-  }, [load]);
+  }, [load, pending.length]);
 
   return (
     <LinearGradient colors={[...BRAND_GRADIENT]} style={{ flex: 1 }}>
@@ -113,6 +117,28 @@ export default function AsistenciaScreen() {
       <View className="px-5">
         <SyncIndicator />
       </View>
+
+      {pending.length > 0 && (
+        <View className="px-5 pt-3">
+          {pending.map((item) => (
+            <View
+              key={item.clientPunchId}
+              className="mb-2 flex-row items-center rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4"
+            >
+              <Clock size={17} color={colors.amber} />
+              <View className="ml-3 flex-1">
+                <Text className="text-sm font-semibold text-white">
+                  {PUNCH_LABELS[item.payload.punchType]}
+                </Text>
+                <Text className="mt-0.5 text-xs text-amber-400">Pendiente de sincronizar</Text>
+              </View>
+              <Text className="text-base font-bold tabular-nums text-white">
+                {new Date(item.payload.deviceTimestamp).toLocaleTimeString("es-PE")}
+              </Text>
+            </View>
+          ))}
+        </View>
+      )}
 
       <FlatList
         data={items}

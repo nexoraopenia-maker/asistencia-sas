@@ -39,6 +39,24 @@ describe("nextPunchType", () => {
     expect(nextPunchType(dayWith(["IN", "LUNCH_START", "LUNCH_END"]))).toBe("OUT");
   });
 
+  it("sin red tiene en cuenta lo que quedo en cola", () => {
+    const now = Date.parse("2026-09-09T03:00:00Z");
+    const pending = [{ punchType: "IN" as const, at: now - 5 * 3_600_000 }];
+    expect(nextPunchType(dayWith([]), undefined, { pending, now })).toBe("LUNCH_START");
+    expect(nextPunchType(dayWith([]), undefined, { pending, now: now + 24 * 3_600_000 })).toBe("IN");
+  });
+
+  it("una copia antigua del calendario no bloquea la entrada del dia siguiente", () => {
+    const now = Date.parse("2026-09-10T14:00:00Z");
+    const closed = { date: "2026-09-09", isOpen: false, allowedPunches: [] };
+    expect(nextPunchType(undefined, closed, { staleSince: now - 24 * 3_600_000, now })).toBe("IN");
+  });
+
+  it("en turno noche manda la jornada abierta que informa el servidor", () => {
+    const current = { date: "2026-09-08", isOpen: true, allowedPunches: ["OUT" as const] };
+    expect(nextPunchType(dayWith([]), current)).toBe("OUT");
+  });
+
   it("no ofrece ninguna accion con la jornada cerrada", () => {
     expect(nextPunchType(dayWith(["IN", "LUNCH_START", "LUNCH_END", "OUT"]))).toBeNull();
   });

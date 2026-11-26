@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 import { AccountBanner } from "../../components/account-banner";
 import { BranchProvider } from "../../components/branch-context";
+import { OfflineBanner } from "../../components/offline-banner";
 import { Sidebar } from "../../components/sidebar";
 import { getSessionProfile } from "../../lib/session";
 
@@ -17,6 +18,7 @@ export default async function DashboardLayout({ children }: { children: React.Re
       <div className="flex min-h-screen flex-col lg:flex-row">
         <Sidebar profile={profile} />
         <main className="min-w-0 flex-1 bg-background">
+          <OfflineBanner />
           <AccountBanner />
           {children}
         </main>

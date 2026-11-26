@@ -123,6 +123,15 @@ export const AbsenceType = {
 } as const;
 export type AbsenceType = (typeof AbsenceType)[keyof typeof AbsenceType];
 
+export const ABSENCE_LABELS: Record<AbsenceType, string> = {
+  MEDICAL_LEAVE: "Descanso medico",
+  JUSTIFIED_TARDINESS: "Tardanza justificada",
+  OVERTIME_REQUEST: "Horas extra solicitadas",
+  VACATION: "Vacaciones",
+  PERSONAL_LEAVE: "Permiso personal",
+  UNJUSTIFIED_ABSENCE: "Falta injustificada",
+};
+
 export const AbsenceStatus = {
   PENDING: "PENDING",
   APPROVED: "APPROVED",
