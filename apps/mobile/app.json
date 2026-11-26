@@ -1,0 +1,68 @@
+{
+  "expo": {
+    "name": "Scire 360 Chronos",
+    "slug": "scire360-chronos",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "scire360",
+    "userInterfaceStyle": "automatic",
+    "platforms": [
+      "ios",
+      "android"
+    ],
+    "newArchEnabled": true,
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#1e1b4b"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.scire360.chronos",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Necesitamos la camara para tomar la selfie que verifica tu marcacion de asistencia.",
+        "NSLocationWhenInUseUsageDescription": "Usamos tu ubicacion para confirmar que marcas dentro del area autorizada de tu sucursal.",
+        "NSFaceIDUsageDescription": "Usa Face ID para acceder de forma rapida y segura a tu cuenta."
+      }
+    },
+    "android": {
+      "package": "com.scire360.chronos",
+      "adaptiveIcon": {
+        "backgroundColor": "#1e1b4b"
+      },
+      "permissions": [
+        "CAMERA",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "USE_BIOMETRIC",
+        "VIBRATE"
+      ]
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Permite el acceso a la camara para tomar la selfie de tu marcacion."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Permite el acceso a tu ubicacion para validar la geocerca de tu sucursal."
+        }
+      ],
+      "expo-sqlite",
+      "expo-font"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "extra": {
+      "apiUrl": "http://localhost:4000"
+    }
+  }
+}

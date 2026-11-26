@@ -1,0 +1,35 @@
+{
+  "name": "scire360-chronos",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Scire 360 Chronos - Plataforma SaaS B2B de control de asistencia, turnos y marcacion movil",
+  "packageManager": "pnpm@11.13.1",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "test": "turbo run test",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "clean": "turbo run clean && rm -rf node_modules",
+    "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,md}\"",
+    "db:generate": "pnpm --filter @scire/database db:generate",
+    "db:migrate": "pnpm --filter @scire/database db:migrate",
+    "db:deploy": "pnpm --filter @scire/database db:deploy",
+    "db:push": "pnpm --filter @scire/database db:push",
+    "db:seed": "pnpm --filter @scire/database db:seed",
+    "db:reset": "pnpm --filter @scire/database db:reset",
+    "db:studio": "pnpm --filter @scire/database db:studio",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "prettier": "^3.4.2",
+    "turbo": "^2.3.3",
+    "typescript": "^5.7.3"
+  }
+}

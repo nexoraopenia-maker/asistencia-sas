@@ -1,0 +1,199 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* =============================================================================
+   Design tokens — Scire 360 Chronos
+   =============================================================================
+   Todo el color sale de variables CSS. Un componente NUNCA fija un tono de
+   Tailwind directamente (`text-emerald-400`), porque un tono que se lee bien
+   sobre el gradiente noche-purpura resulta ilegible sobre blanco: `amber-400`
+   sobre fondo claro da 1.54:1, muy por debajo del 4.5:1 que exige WCAG AA.
+
+   Los pares de esta hoja estan medidos: ver docs/design-system.md.
+   ============================================================================= */
+
+@layer base {
+  :root {
+    /* --- Superficies (tema claro) --- */
+    --background: 0 0% 100%;
+    --foreground: 222 47% 11%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+
+    --primary: 243 75% 59%; /* brand-600 #4f46e5 */
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 220 14% 96%;
+    --secondary-foreground: 222 47% 11%;
+
+    --muted: 220 14% 96%;
+    --muted-foreground: 220 9% 46%; /* 4.83:1 */
+
+    --accent: 174 84% 26%; /* teal-700: 5.0:1 sobre tinte claro */
+    --accent-foreground: 0 0% 100%;
+
+    --destructive: 347 77% 40%; /* rose-700 */
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 220 13% 91%;
+    --input: 220 13% 91%;
+    --ring: 243 75% 59%;
+
+    /* --- Estados semanticos ---
+       En claro se usan los tonos 600-700: son los unicos que superan AA sobre
+       un tinte del 10 % sobre blanco. El fondo y el borde translucidos se
+       mantienen porque son los que dan el aspecto de la marca. */
+    --state-success-fg: 161 94% 24%; /* emerald-700 · 4.99:1 */
+    --state-success-bg: 160 84% 39%;
+    --state-warning-fg: 26 90% 37%; /* amber-700 · 4.65:1 */
+    --state-warning-bg: 38 92% 50%;
+    --state-danger-fg: 336 78% 41%; /* rose-700 · 5.52:1 */
+    --state-danger-bg: 350 89% 60%;
+    --state-info-fg: 243 75% 59%; /* indigo-600 · 5.56:1 */
+    --state-info-bg: 239 84% 67%;
+    --state-violet-fg: 263 70% 50%; /* violet-600 · 5.04:1 */
+    --state-violet-bg: 258 90% 66%;
+
+    --radius: 1rem; /* rounded-2xl como base del sistema */
+
+    /* El navegador pinta scrollbars, autofill y selectores de fecha segun
+       esto: sin declararlo, el modo oscuro se rompe en los bordes. */
+    color-scheme: light;
+  }
+
+  /* Tema oscuro. Es el modo por defecto del producto: los paneles de RRHH se
+     miran durante horas y el gradiente profundo es la identidad de marca. */
+  .dark {
+    --background: 222 47% 6%;
+    --foreground: 210 40% 98%; /* 18.68:1 */
+
+    --card: 224 44% 9%;
+    --card-foreground: 210 40% 98%;
+
+    --popover: 224 44% 9%;
+    --popover-foreground: 210 40% 98%;
+
+    --primary: 239 84% 67%; /* brand-400 */
+    --primary-foreground: 222 47% 8%;
+
+    --secondary: 223 39% 15%;
+    --secondary-foreground: 210 40% 98%;
+
+    --muted: 223 39% 15%;
+    --muted-foreground: 215 20% 65%; /* 7.28:1 — slate-400, no slate-500 */
+
+    --accent: 173 80% 45%; /* teal · 9.47:1 */
+    --accent-foreground: 222 47% 8%;
+
+    --destructive: 0 63% 45%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 215 28% 20%;
+    --input: 215 28% 20%;
+    --ring: 239 84% 67%;
+
+    /* Los tonos 400 de la marca: exactamente la paleta del brief, y sobre el
+       fondo oscuro superan AA con holgura. */
+    --state-success-fg: 158 64% 52%; /* emerald-400 · 8.45:1 */
+    --state-success-bg: 160 84% 39%;
+    --state-warning-fg: 43 96% 56%; /* amber-400 · 9.67:1 */
+    --state-warning-bg: 38 92% 50%;
+    --state-danger-fg: 351 95% 71%; /* rose-400 · 6.40:1 */
+    --state-danger-bg: 350 89% 60%;
+    --state-info-fg: 234 89% 74%; /* indigo-400 · 5.70:1 */
+    --state-info-bg: 239 84% 67%;
+    --state-violet-fg: 255 92% 76%; /* violet-400 · 6.24:1 — el 500 falla */
+    --state-violet-bg: 258 90% 66%;
+
+    color-scheme: dark;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings:
+      "rlig" 1,
+      "calt" 1;
+  }
+
+  /* Cifras de anchura fija: sin esto las horas HH:mm:ss bailan al refrescarse
+     en vivo y la tabla parece temblar. */
+  .tabular-time,
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Foco visible y consistente en todo el panel. El navegador lo dibuja de
+     formas distintas segun el control; unificarlo evita que un usuario de
+     teclado pierda de vista donde esta. */
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+}
+
+@layer components {
+  /* --- Estados de asistencia ---
+     Un solo sitio donde vive el aspecto de un badge. Los tonos salen de las
+     variables, asi que cambian con el tema y no hay forma de escribir uno que
+     falle el contraste sin saltarse esta clase. */
+  .badge-success {
+    border: 1px solid hsl(var(--state-success-bg) / 0.25);
+    background-color: hsl(var(--state-success-bg) / 0.1);
+    color: hsl(var(--state-success-fg));
+  }
+
+  .badge-warning {
+    border: 1px solid hsl(var(--state-warning-bg) / 0.25);
+    background-color: hsl(var(--state-warning-bg) / 0.1);
+    color: hsl(var(--state-warning-fg));
+  }
+
+  .badge-danger {
+    border: 1px solid hsl(var(--state-danger-bg) / 0.25);
+    background-color: hsl(var(--state-danger-bg) / 0.1);
+    color: hsl(var(--state-danger-fg));
+  }
+
+  .badge-info {
+    border: 1px solid hsl(var(--state-info-bg) / 0.25);
+    background-color: hsl(var(--state-info-bg) / 0.1);
+    color: hsl(var(--state-info-fg));
+  }
+
+  .badge-violet {
+    border: 1px solid hsl(var(--state-violet-bg) / 0.25);
+    background-color: hsl(var(--state-violet-bg) / 0.1);
+    color: hsl(var(--state-violet-fg));
+  }
+
+  /* Superficie estandar: borde ultrafino y elevacion difuminada. */
+  .surface {
+    @apply rounded-2xl border border-border bg-card shadow-elevated;
+  }
+}
+
+@layer utilities {
+  /* Quien prefiere menos movimiento no deberia sufrir el barrido del shimmer
+     ni las transiciones de Framer Motion. Es un requisito de accesibilidad,
+     no una preferencia estetica. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}

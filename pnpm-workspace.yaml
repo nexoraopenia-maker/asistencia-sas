@@ -1,0 +1,25 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# Metro (React Native) no resuelve de forma fiable el node_modules anidado por
+# defecto de pnpm. El linker "hoisted" produce un arbol plano estilo npm, que es
+# lo que Expo espera.
+# OJO: desde pnpm 10 estos ajustes van AQUI, no en .npmrc — en .npmrc se ignoran
+# en silencio y el arbol queda a medio instalar.
+nodeLinker: hoisted
+shamefullyHoist: true
+strictPeerDependencies: false
+autoInstallPeers: true
+
+# pnpm 10+ bloquea los scripts de postinstall salvo aprobacion explicita.
+# Estos los necesitan de verdad:
+#   prisma / @prisma/client / @prisma/engines -> binarios del motor de consultas
+#   esbuild        -> binario nativo del compilador
+#   unrs-resolver  -> binario nativo del resolver de ESLint
+allowBuilds:
+  "@prisma/client": true
+  "@prisma/engines": true
+  esbuild: true
+  prisma: true
+  unrs-resolver: true

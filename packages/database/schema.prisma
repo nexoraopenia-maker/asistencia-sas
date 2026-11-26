@@ -1,0 +1,772 @@
+// =============================================================================
+// Scire 360 Chronos — Esquema de datos
+//
+// Estrategia multi-tenant: Shared Database / Shared Schema.
+// TODA tabla transaccional lleva `companyId` NOT NULL, con FK a Company
+// (onDelete: Cascade) y como PRIMERA columna de cada indice compuesto.
+// Ver docs/multitenancy.md.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  // Sin pooler: `prisma migrate` necesita una sesion con estado.
+  directUrl = env("DIRECT_URL")
+}
+
+// =============================================================================
+// ENUMS  (espejo exacto de packages/shared/src/enums.ts)
+// =============================================================================
+
+enum SubscriptionTier {
+  FREE
+  STARTER
+  BUSINESS
+  ENTERPRISE
+}
+
+/// Estado operativo de la cuenta: la unica fuente de verdad sobre si una
+/// empresa puede usar la plataforma. Distinto de `Subscription.status`, que
+/// refleja lo que dice la pasarela de pago.
+enum AccountStatus {
+  TRIALING
+  ACTIVE
+  /// Cobro fallido. Sigue operando durante los dias de gracia.
+  PAST_DUE
+  SUSPENDED
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  SUSPENDED
+  CANCELLED
+}
+
+enum BillingInterval {
+  MONTHLY
+  YEARLY
+}
+
+enum PaymentProvider {
+  MERCADOPAGO
+  STRIPE
+}
+
+enum InvoiceStatus {
+  DRAFT
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+  VOID
+}
+
+enum UserRole {
+  EMPLOYEE
+  SUPERVISOR
+  HR_ADMIN
+  SUPER_ADMIN
+}
+
+enum UserStatus {
+  INVITED
+  ACTIVE
+  SUSPENDED
+  TERMINATED
+}
+
+enum ShiftType {
+  WORK
+  LUNCH
+}
+
+enum PunchType {
+  IN
+  OUT
+  LUNCH_START
+  LUNCH_END
+}
+
+enum PunchSource {
+  MOBILE
+  MOBILE_OFFLINE
+  WEB
+  MANUAL
+  /// Recibida de un reloj biometrico (huella, rostro, tarjeta) o importada de su log.
+  BIOMETRIC
+}
+
+enum VerificationStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+  SUSPICIOUS
+  MANUAL_OVERRIDE
+}
+
+enum AbsenceType {
+  MEDICAL_LEAVE
+  JUSTIFIED_TARDINESS
+  OVERTIME_REQUEST
+  VACATION
+  PERSONAL_LEAVE
+  UNJUSTIFIED_ABSENCE
+}
+
+enum AbsenceStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  VOID
+  APPROVE
+  REJECT
+  LOGIN
+  LOGOUT
+  EXPORT
+  PERMISSION_CHANGE
+}
+
+// =============================================================================
+// TENANT
+// =============================================================================
+
+/// La raiz del aislamiento. Todo dato de cliente cuelga de aqui.
+model Company {
+  id       String  @id @default(cuid())
+  name     String
+  /// Identificador legible para URLs y subdominios futuros.
+  slug     String  @unique
+  /// RUC / CUIT / NIT segun el pais.
+  taxId    String?
+  /// Zona IANA. Convierte los instantes UTC a la hora local del negocio.
+  timezone String  @default("America/Lima")
+  logoUrl  String?
+
+  // --- Reglas de asistencia configurables por empresa ---
+  /// Minutos de gracia antes de contabilizar tardanza.
+  lateToleranceMinutes       Int     @default(10)
+  /// Minutos de gracia para la salida anticipada.
+  earlyLeaveToleranceMinutes Int     @default(10)
+  /// Si false, se puede marcar sin selfie (kioscos, entornos sin camara).
+  requireSelfie              Boolean @default(true)
+  /// Si false, se puede marcar fuera de la geocerca (personal de campo).
+  requireGeofence            Boolean @default(true)
+  /// Face-match solo disponible en ENTERPRISE; este flag es el interruptor del tenant.
+  faceMatchEnabled           Boolean @default(false)
+  /// Umbral de similitud (0-100) por debajo del cual la marcacion se rechaza.
+  faceMatchMinScore          Float   @default(85)
+
+  /// Meses que se conservan las selfies antes de la purga automatica.
+  /// Configurable por empresa: el plazo legal de conservacion de datos
+  /// biometricos varia por pais y por convenio.
+  dataRetentionMonths Int @default(12)
+
+  // --- Plan ---
+  /// Duplicado de Subscription.tier para evitar un JOIN en cada request.
+  /// Subscription es la fuente de verdad; los webhooks de billing sincronizan ambos.
+  tier         SubscriptionTier @default(FREE)
+  /// Materializado (no derivado del tier) para permitir limites negociados
+  /// en cuentas ENTERPRISE y chequear la cuota con un solo COUNT.
+  maxEmployees Int              @default(5)
+
+  /// Estado operativo. Sustituye al antiguo booleano `isActive`: un booleano no
+  /// distingue "en prueba" de "moroso en periodo de gracia" de "suspendido por
+  /// impago", y esos tres casos exigen mensajes y comportamientos distintos.
+  accountStatus AccountStatus @default(TRIALING)
+  /// Fecha de suspension por impago o fin de trial.
+  suspendedAt   DateTime?
+  /// Fin del periodo de gracia tras un cobro fallido. Pasada esta fecha, el
+  /// cron de facturacion mueve la cuenta a SUSPENDED.
+  graceEndsAt   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  branches         Branch[]
+  users            User[]
+  sessions         Session[]
+  shifts           Shift[]
+  attendance       AttendanceRecord[]
+  absences         Absence[]
+  auditLogs        AuditLog[]
+  subscription     Subscription?
+  invoices         Invoice[]
+  webhooks         WebhookEndpoint[]
+  biometricDevices BiometricDevice[]
+
+  @@index([slug])
+  @@index([tier, accountStatus])
+  /// Sostiene el cron que suspende cuentas al vencer la gracia o el trial.
+  @@index([accountStatus, graceEndsAt])
+}
+
+/// Centro de trabajo con geocerca circular (centro + radio en metros).
+model Branch {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  name    String
+  address String?
+
+  // --- Geocerca ---
+  latitude     Float
+  longitude    Float
+  /// Radio autorizado en metros. Minimo practico 20 m: por debajo, el ruido del
+  /// GPS urbano produce falsos rechazos constantes.
+  radiusMeters Int   @default(100)
+
+  /// Sobreescribe la zona horaria de la empresa (empresas multi-pais).
+  timezone String?
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users            User[]
+  shifts           Shift[]
+  attendance       AttendanceRecord[]
+  biometricDevices BiometricDevice[]
+
+  @@unique([companyId, name])
+  @@index([companyId, isActive])
+}
+
+// =============================================================================
+// IDENTIDAD
+// =============================================================================
+
+model User {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  /// Sucursal base. Determina contra que geocerca se valida por defecto.
+  branchId String?
+  branch   Branch? @relation(fields: [branchId], references: [id], onDelete: SetNull)
+
+  /// Identificador de login de la plataforma: unico globalmente, no por tenant.
+  email        String  @unique
+  /// Null mientras el usuario esta INVITED y no ha fijado contrasena.
+  passwordHash String?
+
+  fullName     String
+  /// Documento de identidad o codigo interno. Unico DENTRO de la empresa:
+  /// un @unique global filtraria la existencia de un empleado entre tenants.
+  employeeCode String
+  jobTitle     String?
+  /// E.164, para las notificaciones de Evolution API / WhatsApp.
+  phone        String?
+
+  /// Clave S3/R2 de la foto de perfil oficial: es el patron del face-match.
+  /// Nunca se guarda una URL publica.
+  profilePhotoKey String?
+
+  role   UserRole   @default(EMPLOYEE)
+  status UserStatus @default(INVITED)
+
+  hiredAt      DateTime?
+  terminatedAt DateTime?
+
+  // --- Autenticacion ---
+  emailVerifiedAt     DateTime?
+  lastLoginAt         DateTime?
+  /// Hash del token de invitacion (email/WhatsApp). Nunca el token en claro.
+  invitationTokenHash String?   @unique
+  invitationExpiresAt DateTime?
+  /// El usuario habilito huella/Face ID en al menos un dispositivo.
+  biometricEnabled    Boolean   @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sessions         Session[]
+  shifts           Shift[]            @relation("ShiftAssignee")
+  createdShifts    Shift[]            @relation("ShiftCreator")
+  attendance       AttendanceRecord[] @relation("PunchOwner")
+  voidedRecords    AttendanceRecord[] @relation("PunchVoider")
+  absences         Absence[]          @relation("AbsenceOwner")
+  reviewedAbsences Absence[]          @relation("AbsenceReviewer")
+  auditLogs        AuditLog[]         @relation("AuditActor")
+
+  @@unique([companyId, employeeCode])
+  @@index([companyId, status])
+  @@index([companyId, branchId])
+  @@index([companyId, role])
+}
+
+/// Sesion activa = un refresh token vivo en un dispositivo.
+/// Permite revocar un aparato concreto sin cerrar las demas sesiones.
+model Session {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// SHA-256 del refresh token. El token en claro solo existe en el cliente.
+  refreshTokenHash String  @unique
+  deviceId         String?
+  deviceName       String?
+  userAgent        String?
+  ipAddress        String?
+
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  lastUsedAt DateTime  @default(now())
+
+  /// Rotacion de refresh tokens: apunta a la sesion que la sustituyo.
+  /// Si llega un token ya rotado, es senal de robo -> se revoca toda la cadena.
+  replacedBySessionId String?
+
+  createdAt DateTime @default(now())
+
+  @@index([companyId, userId])
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+}
+
+// =============================================================================
+// TURNOS
+// =============================================================================
+
+/// Un tramo horario con tipo. Una jornada estandar son DOS filas:
+///   WORK  09:00:00 - 18:00:00
+///   LUNCH 13:00:00 - 14:00:00
+/// Modelarlo asi (en vez de campos lunchStart/lunchEnd dentro del turno de
+/// trabajo) admite jornadas partidas y dobles refrigerios sin tocar el esquema.
+model Shift {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  userId String
+  user   User   @relation("ShiftAssignee", fields: [userId], references: [id], onDelete: Cascade)
+
+  branchId String?
+  branch   Branch? @relation(fields: [branchId], references: [id], onDelete: SetNull)
+
+  /// Dia de la jornada en la zona horaria de la empresa. Solo fecha, sin hora.
+  date DateTime  @db.Date
+  type ShiftType
+
+  /// `HH:mm:ss` local, no un instante: "las 09:00" no se desplaza con el DST.
+  startTime String @db.VarChar(8)
+  endTime   String @db.VarChar(8)
+
+  notes String?
+
+  createdById String?
+  createdBy   User?   @relation("ShiftCreator", fields: [createdById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  attendance AttendanceRecord[]
+
+  /// Impide duplicar el mismo tramo al reasignar una plantilla masiva.
+  @@unique([companyId, userId, date, type, startTime])
+  @@index([companyId, date])
+  @@index([companyId, userId, date])
+  @@index([companyId, branchId, date])
+}
+
+// =============================================================================
+// MARCACION
+// =============================================================================
+
+/// Tabla de mayor crecimiento del sistema. Candidata a particionado por RANGE
+/// sobre `serverTimestamp` cuando supere ~50 M de filas.
+model AttendanceRecord {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  userId String
+  user   User   @relation("PunchOwner", fields: [userId], references: [id], onDelete: Cascade)
+
+  branchId String
+  branch   Branch @relation(fields: [branchId], references: [id], onDelete: Restrict)
+
+  /// Turno contra el que se evalua puntualidad. Null si no habia turno asignado.
+  shiftId String?
+  shift   Shift?  @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+
+  punchType PunchType
+  source    PunchSource @default(MOBILE)
+
+  /// Instante autoritativo: reloj del SERVIDOR en UTC. Es el valor con validez legal.
+  serverTimestamp  DateTime @default(now())
+  /// Reloj del DISPOSITIVO al marcar. Se conserva para auditar el modo offline
+  /// y para detectar manipulacion del reloj del telefono.
+  deviceTimestamp  DateTime
+  /// deviceTimestamp - serverTimestamp en segundos. Positivo = movil adelantado.
+  /// En una marcacion online un desfase alto es sospechoso; en una offline
+  /// equivale al tiempo que estuvo encolada.
+  clockSkewSeconds Int      @default(0)
+
+  /// Clave del objeto en S3/R2. La imagen SOLO se sirve via presigned URL de
+  /// vida corta: nunca se guarda ni se expone una URL publica.
+  /// Se pone a null cuando la purga de retencion elimina el archivo.
+  selfieObjectKey String?
+  /// Momento en que la selfie se elimino por politica de retencion.
+  /// Distingue "nunca tuvo foto" de "la tuvo y se purgo por cumplimiento":
+  /// sin este campo, una auditoria no podria diferenciar una marcacion sin
+  /// verificar de una depurada conforme a la ley.
+  selfiePurgedAt  DateTime?
+
+  // --- Telemetria de posicion ---
+  latitude         Float?
+  longitude        Float?
+  /// Precision horizontal reportada por el GPS, en metros.
+  accuracyMeters   Float?
+  altitudeMeters   Float?
+  /// Distancia calculada por Haversine al centro de la geocerca de la sucursal.
+  distanceMeters   Float?
+  isWithinGeofence Boolean?
+  /// El dispositivo declaro una ubicacion simulada (Android isFromMockProvider).
+  /// Es una senal, no una prueba: siempre se registra; segun REJECT_MOCK_LOCATION
+  /// la marcacion se rechaza o se guarda como SUSPICIOUS.
+  isMockLocation   Boolean  @default(false)
+
+  // --- Verificacion ---
+  verificationStatus VerificationStatus @default(PENDING)
+  /// Similitud 0-100 devuelta por AWS Rekognition. Null si el tenant no tiene
+  /// face-match habilitado o si aun no se ha procesado.
+  faceMatchScore     Float?
+  faceMatchedAt      DateTime?
+
+  /// Minutos de tardanza ya descontada la tolerancia de la empresa.
+  /// Se materializa al crear el registro para que los reportes de nomina no
+  /// tengan que recalcular la regla vigente en aquel momento.
+  tardinessMinutes Int @default(0)
+
+  /// UUID generado por el cliente. Hace la marcacion idempotente: un reintento
+  /// por timeout de red, o el reenvio de un lote offline, no puede duplicarla.
+  clientPunchId String
+
+  /// Reloj biometrico que registro la marcacion. Null en marcaciones moviles.
+  biometricDeviceId String?
+  biometricDevice   BiometricDevice? @relation(fields: [biometricDeviceId], references: [id], onDelete: SetNull)
+
+  notes String?
+
+  // --- Anulacion (soft delete: nunca se borra un registro con valor legal) ---
+  isVoided   Boolean   @default(false)
+  voidedAt   DateTime?
+  voidedById String?
+  voidedBy   User?     @relation("PunchVoider", fields: [voidedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([companyId, clientPunchId])
+  @@index([companyId, serverTimestamp])
+  @@index([companyId, userId, serverTimestamp])
+  @@index([companyId, branchId, serverTimestamp])
+  @@index([companyId, verificationStatus])
+  /// Sostiene el feed de alertas en tiempo real del dashboard.
+  @@index([companyId, isMockLocation, serverTimestamp])
+  @@index([shiftId])
+  /// Sostiene el barrido de purga: busca selfies antiguas aun sin depurar.
+  @@index([companyId, selfiePurgedAt, serverTimestamp])
+}
+
+/// Reloj biometrico (o conector que lee su log) autorizado a enviar marcaciones.
+///
+/// Se autentica con un token propio, no con un usuario: un aparato colgado en
+/// la pared no puede renovar un JWT de 15 minutos. El token identifica a la
+/// empresa —y opcionalmente a la sucursal— sin que el cuerpo de la peticion
+/// pueda elegir a que tenant escribe.
+model BiometricDevice {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  /// Sucursal por defecto de las marcaciones que envia. Si es null, cada
+  /// marcacion debe indicar su `branchId`.
+  branchId String?
+  branch   Branch? @relation(fields: [branchId], references: [id], onDelete: SetNull)
+
+  name         String
+  /// Numero de serie del fabricante (ZKTeco, Hikvision, Suprema...). Informativo.
+  serialNumber String?
+
+  /// SHA-256 del token. El token en claro solo se muestra una vez, al crearlo.
+  tokenHash   String @unique
+  /// Primeros caracteres del token, para reconocerlo en el panel sin exponerlo.
+  tokenPrefix String
+
+  isActive   Boolean   @default(true)
+  lastSeenAt DateTime?
+  revokedAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  attendance AttendanceRecord[]
+
+  @@unique([companyId, name])
+  @@index([companyId, isActive])
+}
+
+// =============================================================================
+// AUSENCIAS Y EXCEPCIONES
+// =============================================================================
+
+/// Bajas medicas, tardanzas justificadas y solicitudes de horas extra comparten
+/// tabla: mismo ciclo de vida (solicitud -> revision -> resolucion) y mismo
+/// efecto sobre el calculo de nomina.
+model Absence {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  userId String
+  user   User   @relation("AbsenceOwner", fields: [userId], references: [id], onDelete: Cascade)
+
+  type   AbsenceType
+  status AbsenceStatus @default(PENDING)
+
+  startDate DateTime @db.Date
+  endDate   DateTime @db.Date
+
+  reason String
+
+  /// Clave S3/R2 del justificante (certificado medico, etc.).
+  attachmentObjectKey String?
+
+  /// Solo para OVERTIME_REQUEST.
+  requestedMinutes Int?
+  approvedMinutes  Int?
+
+  reviewedById String?
+  reviewedBy   User?     @relation("AbsenceReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  reviewedAt   DateTime?
+  reviewNotes  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([companyId, userId, startDate])
+  @@index([companyId, status])
+  @@index([companyId, startDate, endDate])
+}
+
+// =============================================================================
+// AUDITORIA
+// =============================================================================
+
+/// Rastro inmutable para cumplimiento laboral.
+///
+/// APPEND-ONLY por contrato: la aplicacion nunca hace UPDATE ni DELETE sobre
+/// esta tabla. No lleva `updatedAt` a proposito — su ausencia hace evidente en
+/// el propio esquema que una fila jamas cambia. En produccion se refuerza con
+/// un rol de base de datos sin permisos UPDATE/DELETE sobre audit_logs.
+model AuditLog {
+  id String @id @default(cuid())
+
+  /// Nullable solo para eventos de plataforma anteriores a la creacion del tenant.
+  companyId String?
+  company   Company? @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  /// Modelo afectado: "AttendanceRecord", "Shift", "User"...
+  entityType String
+  /// Id de la fila afectada (el `recordId` en el caso de una marcacion).
+  recordId   String
+
+  action AuditAction
+
+  /// Null si el actor es el sistema (cron, webhook).
+  modifiedByUserId String?
+  modifiedBy       User?   @relation("AuditActor", fields: [modifiedByUserId], references: [id], onDelete: SetNull)
+
+  /// Estado anterior y posterior de los campos que cambiaron (solo el diff,
+  /// no la fila completa: evita inflar la tabla y duplicar datos personales).
+  previousValue Json?
+  newValue      Json?
+
+  /// Justificacion que introdujo quien hizo el cambio. Obligatoria en la UI
+  /// para ediciones y anulaciones de marcaciones.
+  reason String?
+
+  ipAddress String?
+  userAgent String?
+
+  timestamp DateTime @default(now())
+
+  @@index([companyId, timestamp])
+  @@index([companyId, entityType, recordId])
+  @@index([companyId, modifiedByUserId, timestamp])
+  @@index([timestamp])
+}
+
+// =============================================================================
+// FACTURACION
+// =============================================================================
+
+/// Fuente de verdad del plan. Company.tier es una copia denormalizada que los
+/// webhooks de facturacion mantienen sincronizada.
+model Subscription {
+  id        String  @id @default(cuid())
+  /// 1:1 — una empresa tiene exactamente una suscripcion.
+  companyId String  @unique
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  tier     SubscriptionTier   @default(FREE)
+  status   SubscriptionStatus @default(TRIALING)
+  interval BillingInterval    @default(MONTHLY)
+
+  provider               PaymentProvider @default(MERCADOPAGO)
+  /// Identificadores del proveedor (preapproval_id de MercadoPago, sub_ de Stripe).
+  externalCustomerId     String?
+  externalSubscriptionId String?
+
+  currentPeriodStart DateTime?
+  currentPeriodEnd   DateTime?
+  trialEndsAt        DateTime?
+
+  cancelAtPeriodEnd Boolean   @default(false)
+  cancelledAt       DateTime?
+
+  /// Asientos contratados. El limite efectivo es Company.maxEmployees.
+  seats       Int    @default(5)
+  /// En centavos, para no arrastrar errores de coma flotante en dinero.
+  amountCents Int    @default(0)
+  currency    String @default("USD")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  invoices Invoice[]
+
+  @@index([status, currentPeriodEnd])
+  @@index([externalSubscriptionId])
+}
+
+model Invoice {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  subscriptionId String?
+  subscription   Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+
+  provider          PaymentProvider
+  /// Id del cobro en el proveedor. Unico: da idempotencia al webhook de pago.
+  externalInvoiceId String?         @unique
+
+  status      InvoiceStatus @default(PENDING)
+  amountCents Int
+  currency    String        @default("USD")
+
+  periodStart DateTime?
+  periodEnd   DateTime?
+
+  issuedAt      DateTime  @default(now())
+  paidAt        DateTime?
+  failedAt      DateTime?
+  failureReason String?
+
+  /// Enlace al comprobante alojado por el proveedor.
+  hostedInvoiceUrl String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([companyId, issuedAt])
+  @@index([companyId, status])
+}
+
+/// Bitacora de webhooks entrantes de la pasarela.
+/// `externalEventId` unico = un evento reenviado por el proveedor no se
+/// procesa dos veces. Es tabla de plataforma: no lleva companyId obligatorio.
+model BillingWebhookEvent {
+  id              String          @id @default(cuid())
+  provider        PaymentProvider
+  externalEventId String
+  eventType       String
+  /// Resuelto desde el external_reference del proveedor. Null si no mapea.
+  companyId       String?
+
+  payload     Json
+  processedAt DateTime?
+  error       String?
+  attempts    Int       @default(0)
+
+  createdAt DateTime @default(now())
+
+  @@unique([provider, externalEventId])
+  @@index([companyId, createdAt])
+  @@index([processedAt])
+}
+
+// =============================================================================
+// NOTIFICACIONES SALIENTES (n8n / Evolution API)
+// =============================================================================
+
+model WebhookEndpoint {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  name   String
+  url    String
+  /// Secreto compartido para firmar el payload con HMAC-SHA256.
+  secret String
+  /// Eventos suscritos: "punch.late", "punch.mock_location", "absence.created"...
+  events String[]
+
+  isActive       Boolean   @default(true)
+  lastDeliveryAt DateTime?
+  /// Fallos consecutivos. Al superar el umbral, el endpoint se desactiva solo.
+  failureCount   Int       @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  deliveries WebhookDelivery[]
+
+  @@unique([companyId, name])
+  @@index([companyId, isActive])
+}
+
+/// Outbox de entregas. Desacopla la marcacion de la notificacion: si n8n esta
+/// caido, la marcacion se completa igual y el evento se reintenta despues.
+model WebhookDelivery {
+  id        String @id @default(cuid())
+  companyId String
+
+  endpointId String
+  endpoint   WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+
+  eventType String
+  payload   Json
+
+  attempts      Int       @default(0)
+  deliveredAt   DateTime?
+  lastAttemptAt DateTime?
+  responseCode  Int?
+  error         String?
+  /// Proximo reintento con backoff exponencial.
+  nextRetryAt   DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([companyId, createdAt])
+  @@index([deliveredAt, nextRetryAt])
+}
